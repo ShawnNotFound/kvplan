@@ -129,7 +129,7 @@ def _resolve_gpu(args) -> tuple[int, str, int, str, list]:
         return gpu_total_bytes(args.gpu), args.gpu, other, args.gpu, []
     chosen = select_gpus(query_nvidia_smi(), args.tensor_parallel_size, _parse_indices(args.gpu_index))
     # vLLM sizes every rank like the smallest GPU; the busiest GPU decides whether it starts.
-    total = min(g.total_mib for g in chosen) * 2**20
+    total = min(g.cuda_total_mib for g in chosen) * 2**20
     if args.other_gpu_mem_gib is None:
         other = max(g.used_mib or 0 for g in chosen) * 2**20
     names = sorted({g.name for g in chosen})
@@ -156,7 +156,7 @@ def cmd_check(args) -> int:
     if args.json:
         extra = {"spec_notes": loaded.spec.notes, "other_process_bytes": other}
         if detected:
-            extra["detected_gpus"] = [g.__dict__ for g in detected]
+            extra["detected_gpus"] = [g.__dict__ | {"cuda_total_mib": g.cuda_total_mib} for g in detected]
         print(json.dumps(p.to_dict() | extra, indent=2))
         return 0 if p.starts else 1
 
@@ -166,15 +166,16 @@ def cmd_check(args) -> int:
     print()
     for g in detected:
         used = "unknown" if g.used_mib is None else f"{g.used_mib:,} MiB"
-        print(f"  gpu {g.index:<10} {g.name}: {g.total_mib:,} MiB total, {used} in use (nvidia-smi)")
+        reserved = f", {g.reserved_mib:,} reserved by the driver" if g.reserved_mib else ""
+        print(f"  gpu {g.index:<10} {g.name}: {g.total_mib:,} MiB total{reserved}, {used} in use (nvidia-smi)")
     print(f"  budget         {_gib(p.requested_bytes)} of {_gib(p.gpu_total_bytes)} per GPU")
     print(f"  weights        {_gib(w.per_rank_bytes)} per GPU (exact, from the weight files)")
     o = p.overheads
     if o.user_override:
         print(f"  runtime        {_gib(o.total)} (your --overhead-gib)")
     else:
-        print(f"  runtime        {_gib(o.total)} estimated: activations {_gib(o.activation_bytes)}, "
-              f"sampler logits {_gib(o.logits_bytes)}, CUDA graphs {_gib(o.cudagraph_bytes)}, "
+        print(f"  runtime        {_gib(o.total)} estimated: activation peak {_gib(o.activation_bytes)}, "
+              f"torch.compile {_gib(o.compile_bytes)}, CUDA graphs {_gib(o.cudagraph_bytes)}, "
               f"other {_gib(o.non_torch_bytes)}")
     print(f"  KV cache       {_gib(max(p.available_kv_bytes, 0))} available "
           f"({p.kv_bytes_per_token:,} bytes per token per GPU, {p.kv_cache_dtype}, block size {p.block_size})")
@@ -190,9 +191,9 @@ def cmd_check(args) -> int:
         print(f"  try            {s}")
     for n in loaded.spec.notes + w.notes:
         print(f"  note           {n}")
-    if not o.user_override:
-        print("  note           runtime overheads are estimates until calibrated against real vLLM logs; "
-              "weights and KV sizes are exact")
+    if not o.user_override and not o.calibrated:
+        print("  note           runtime overheads for this model are a rough estimate: they were calibrated on "
+              "dense models only; pass --overhead-gib to override")
     return 0 if p.starts else 1
 
 

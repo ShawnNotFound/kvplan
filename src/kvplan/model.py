@@ -55,6 +55,7 @@ class ModelSpec:
     default_kv_cache_dtype: str | None = None  # what --kv-cache-dtype auto resolves to, if not the model dtype
     source: str = "config"
     notes: list[str] = field(default_factory=list)
+    intermediate_size: int | None = None   # dense MLP width; None for MoE or when unknown
 
     @property
     def is_mla(self) -> bool:
@@ -75,6 +76,11 @@ def _text_config(cfg: dict) -> dict:
         if isinstance(sub, dict) and (sub.get("num_hidden_layers") or sub.get("num_layers")):
             return sub
     return cfg
+
+
+def _int_or_none(v) -> int | None:
+    """A positive integer, or None for missing, per-layer (list) or nonsense values."""
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
 
 
 def _first(cfg: dict, *keys, default=None):
@@ -286,6 +292,8 @@ def spec_from_config(top: dict, tokenizer_config: dict | None = None) -> ModelSp
         num_experts=int(experts) if experts else None,
         source="config",
         notes=notes,
+        intermediate_size=None if experts else _int_or_none(_first(cfg, "intermediate_size", "ffn_hidden_size",
+                                                                   "n_inner")),
     )
 
 
@@ -346,6 +354,7 @@ def spec_from_gguf(meta: dict) -> ModelSpec:
         sliding_window=int(window) if window else None,
         kv_lora_rank=int(kv_lora) if kv_lora is not None else None, qk_rope_head_dim=int(rope) if rope else None,
         tie_word_embeddings=False, dtype="bfloat16", num_experts=g("expert_count"), source="gguf",
+        intermediate_size=None if g("expert_count") else _int_or_none(g("feed_forward_length")),
     )
 
 

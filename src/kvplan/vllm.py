@@ -3,15 +3,21 @@
 vLLM (Worker.determine_available_memory, vllm/v1/worker/gpu_worker.py):
 
     requested = ceil(total * gpu_memory_utilization)
-    available_kv = requested - weights - other_non_kv - cudagraph_estimate
+    available_kv = requested - consumed - profiled_peak
+
+`consumed` is the weights plus non-torch memory; `profiled_peak` is the peak of the
+profiling forward pass and sampler warm-up, which with CUDA graphs on also holds the
+torch.compile buffers and the graph pool (vLLM 0.32 logs: available KV equals
+requested - consumed - peak exactly).
 
 Memory used before vLLM's snapshot (CUDA context, NCCL and cuBLAS buffers, other
 processes) is not charged to `requested`; it must fit in `total - requested`, or vLLM
 refuses to start.
 
-Weights and KV sizes are computed exactly from the model files. Activation peak,
-sampler logits, CUDA-graph memory and the CUDA context are estimates (marked as such in
-the output) until calibrated against real vLLM logs.
+Weights and KV sizes are computed exactly from the model files. The activation peak,
+torch.compile buffers, CUDA-graph memory and non-torch memory are fitted to vLLM 0.32
+startup logs on RTX A6000 and RTX A5000 GPUs for dense models (docs/validation.md); for
+MoE models and models whose MLP width is unknown they fall back to a rougher estimate.
 """
 
 from __future__ import annotations
@@ -25,12 +31,16 @@ from .weights import WeightBreakdown
 
 GiB = 2**30
 DEFAULT_UTILIZATION = 0.92
-# Estimates, to be calibrated against vLLM startup logs (see docs/accounting.md).
+# Fitted to vLLM 0.32 startup logs (docs/validation.md). The CUDA context measured 0.2-0.46 GiB;
+# 0.5 keeps the start check on the safe side.
 CUDA_CONTEXT_BYTES = int(0.5 * GiB)
 NCCL_BYTES_PER_EXTRA_RANK = int(0.25 * GiB)
-CUDAGRAPH_BYTES = int(0.5 * GiB)
-NON_TORCH_BYTES = int(0.25 * GiB)
-LOGITS_COPIES = 2
+# With CUDA graphs on, vLLM's profiled peak (which already contains the graph pool, measured
+# 0.20-0.24 GiB) grows by a fixed part plus a part that scales with batched tokens x hidden.
+CUDAGRAPH_BYTES = int(0.25 * GiB)
+COMPILE_ACTIVATION_FACTOR = 7
+NON_TORCH_BYTES = int(0.25 * GiB)       # measured 0.16-0.39 GiB beyond the weight files
+MLP_PEAK_FACTOR = 2                     # eager peak = 2 x the gate/up projection output
 
 
 @dataclass
@@ -89,15 +99,16 @@ def batch_defaults(total_bytes: int, gpu_name: str = "") -> tuple[int, int]:
 
 @dataclass
 class Overheads:
-    activation_bytes: int
-    logits_bytes: int
+    activation_bytes: int     # peak of one profiling forward pass plus the sampler warm-up
+    compile_bytes: int        # extra torch.compile buffers (0 with enforce_eager)
     cudagraph_bytes: int
     non_torch_bytes: int
     user_override: bool = False
+    calibrated: bool = True   # False when the model falls outside what was measured (MoE, unknown MLP)
 
     @property
     def total(self) -> int:
-        return self.activation_bytes + self.logits_bytes + self.cudagraph_bytes + self.non_torch_bytes
+        return self.activation_bytes + self.compile_bytes + self.cudagraph_bytes + self.non_torch_bytes
 
 
 def estimate_overheads(spec: ModelSpec, cfg: ServeConfig, batched_tokens: int, num_seqs: int) -> Overheads:
@@ -105,13 +116,21 @@ def estimate_overheads(spec: ModelSpec, cfg: ServeConfig, batched_tokens: int, n
         return Overheads(cfg.overhead_bytes, 0, 0, 0, user_override=True)
     vocab = spec.vocab_size or 32000
     hidden = spec.hidden_size or spec.num_heads * spec.head_dim
+    dtype = spec.model_dtype_bytes
     num_reqs = min(num_seqs, batched_tokens)
-    # Sampler warm-up materialises fp32 logits for every request row.
-    logits = num_reqs * vocab * 4 * LOGITS_COPIES
-    # Rough transient activation peak for one forward pass over the batched tokens.
-    activation = batched_tokens * hidden * spec.model_dtype_bytes * 12 // cfg.tp
+    # The sampler warm-up materialises fp32 logits for every request row.
+    logits = num_reqs * vocab * 4
+    if spec.intermediate_size:
+        # The profiling pass peaks in the MLP (gate and up projections over every batched token),
+        # unless the sampler's logits are larger (big vocabularies, small batches).
+        mlp = batched_tokens * spec.intermediate_size * 2 * dtype * MLP_PEAK_FACTOR // cfg.tp
+        activation, calibrated = max(mlp, logits), True
+    else:
+        # MoE or unknown MLP width: the uncalibrated v0.1 estimate.
+        activation, calibrated = batched_tokens * hidden * dtype * 12 // cfg.tp + 2 * logits, False
+    compiled = 0 if cfg.enforce_eager else batched_tokens * hidden * dtype * COMPILE_ACTIVATION_FACTOR // cfg.tp
     graphs = 0 if cfg.enforce_eager else CUDAGRAPH_BYTES
-    return Overheads(activation, logits, graphs, NON_TORCH_BYTES)
+    return Overheads(activation, compiled, graphs, NON_TORCH_BYTES, calibrated=calibrated)
 
 
 @dataclass

@@ -10,27 +10,27 @@ vLLM measures free memory after creating the CUDA context, NCCL buffers and cuBL
 requested = ceil(total_gpu_memory × gpu_memory_utilization)
 ```
 
-`vllm/v1/worker/utils.py` `request_memory`. The default utilisation is 0.92 (`vllm/config/cache.py`). It is a fraction of **total** memory. If free memory at that point is below `requested`, vLLM refuses to start ("Free memory on device ... is less than desired GPU memory utilization"). kvplan models the context and NCCL as estimates (0.5 GiB, plus 0.25 GiB with tensor parallelism) and adds `--other-gpu-mem-gib`.
+`vllm/v1/worker/utils.py` `request_memory`. The default utilisation is 0.92 (`vllm/config/cache.py`). It is a fraction of **total** memory as CUDA reports it, which is `nvidia-smi`'s `memory.total` minus `memory.reserved` (on an RTX A6000: 49140 − 599 MiB = 47.40 GiB, exactly what vLLM logged). `--gpu auto` reads both fields; the presets subtract the reserved part for the GPUs where it was read from the driver (A6000, A5000, RTX 5090 Laptop, V100-32GB). If free memory at that point is below `requested`, vLLM refuses to start ("Free memory on device ... is less than desired GPU memory utilization"). kvplan models the context and NCCL as estimates (0.5 GiB, plus 0.25 GiB with tensor parallelism) and adds `--other-gpu-mem-gib`.
 
 ## 2. What the KV cache gets
 
 ```
-available_kv = requested − weights − (activation peak + persistent buffers + non-torch growth) − CUDA-graph estimate
+available_kv = requested − consumed (weights + non-torch) − profiled peak
 ```
 
-`vllm/v1/worker/gpu_worker.py` `Worker.determine_available_memory`; `vllm/utils/mem_utils.py` `memory_profiling`.
+`vllm/v1/worker/gpu_worker.py` `Worker.determine_available_memory`; `vllm/utils/mem_utils.py` `memory_profiling`. vLLM 0.32 logs all three terms ("Actual usage is … GiB for consumed memory (weights + non-torch), … GiB for peak activation, and … GiB for CUDAGraph memory"), and the available KV memory it reports equals `requested − consumed − peak` exactly: with CUDA graphs on, the graph pool and the torch.compile buffers are part of the profiled peak.
 
 | Term | kvplan | Status |
 |---|---|---|
-| weights | summed per tensor from the weight-file headers, see section 3 | exact |
-| sampler logits | `min(max_num_seqs, max_num_batched_tokens) × vocab × 4 B × 2` | estimate |
-| activation peak | `max_num_batched_tokens × hidden × 2 B × 12 / tp` | estimate |
-| CUDA graphs | 0.5 GiB, 0 with `--enforce-eager` | estimate |
-| non-torch growth | 0.25 GiB | estimate |
+| weights | summed per tensor from the weight-file headers, see section 3 | exact (vLLM reports 0.04–0.10 GiB more; kvplan counts that under non-torch) |
+| non-torch | 0.25 GiB | fitted: measured 0.22–0.46 GiB above the weight files |
+| eager peak | `max(2 × max_num_batched_tokens × intermediate_size × 2 × 2 B / tp, min(max_num_seqs, max_num_batched_tokens) × vocab × 4 B)`: the MLP gate/up output or the sampler's fp32 logits, whichever is larger | fitted: within 0.08 GiB on 5 dense models at 2048 and 8192 batched tokens |
+| torch.compile buffers | `7 × max_num_batched_tokens × hidden × 2 B / tp`, 0 with `--enforce-eager` | fitted: within 0.12 GiB, except Gemma 2 (0.45 GiB low) |
+| CUDA graphs | 0.25 GiB, 0 with `--enforce-eager` | measured 0.20–0.24 GiB |
 
-The estimates can be replaced with `--overhead-gib`. They will be calibrated against real startup logs in v0.2.
+MoE models and models without `intermediate_size` use the older, uncalibrated estimate (`max_num_batched_tokens × hidden × 2 B × 12 / tp` plus two copies of the fp32 logits), and the output says so. Any of these can be replaced with `--overhead-gib`. See [validation.md](validation.md) for the measurements.
 
-Batch defaults follow `EngineArgs.get_batch_defaults` (`vllm/engine/arg_utils.py`), OpenAI-server column: 2048 tokens / 256 sequences on most GPUs and on A100/GB10; 8192 / 1024 from 70 GiB; 16384 / 1024 from 160 GiB.
+Batch defaults follow `EngineArgs.get_batch_defaults` (`vllm/engine/arg_utils.py`), OpenAI-server column (`vllm serve`; the offline `LLM()` class uses larger values, 8192 tokens on most GPUs, so pass `--max-num-batched-tokens 8192` to plan for it): 2048 tokens / 256 sequences on most GPUs and on A100/GB10; 8192 / 1024 from 70 GiB; 16384 / 1024 from 160 GiB.
 
 ## 3. Weights per GPU
 

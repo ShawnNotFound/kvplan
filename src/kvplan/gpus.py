@@ -1,10 +1,13 @@
 """GPU memory sizes.
 
-vLLM sizes everything from the total memory CUDA reports (cudaMemGetInfo), which is a
-little below the marketing figure (ECC and driver reservations). The values here are the
-"memory.total" figures `nvidia-smi` prints, in MiB. They can differ from what CUDA
-reports by a few hundred MiB, so for exact results pass --gpu-mem-gib with the value from
-`python -c "import torch; print(torch.cuda.mem_get_info()[1] / 2**30)"` on the real GPU.
+vLLM sizes everything from the total memory CUDA reports (cudaMemGetInfo). That is the
+"memory.total" figure `nvidia-smi` prints minus "memory.reserved", the part the driver
+keeps for itself (checked on an RTX A6000, an RTX A5000 and an RTX 5090 Laptop GPU: CUDA
+reports exactly total - reserved). GPUS_MIB holds the nvidia-smi totals; for the GPUs in
+RESERVED_MIB the reserved part was read from the driver and is subtracted. The others are
+nvidia-smi totals, which run a few hundred MiB above what CUDA reports, so for exact results
+pass --gpu-mem-gib with `nvidia-smi --query-gpu=memory.total,memory.reserved` (total minus
+reserved, in GiB), or use --gpu auto on the machine itself.
 
 Presets are looked up by name only, so two GPUs with the same size (the RTX A5000 and the
 RTX 4090 both report 24564 MiB) are separate entries and never mistaken for each other.
@@ -42,6 +45,14 @@ GPUS_MIB = {
     "V100-16GB": 16384,
 }
 
+# Driver-reserved memory (nvidia-smi "memory.reserved"), read on the real GPU.
+RESERVED_MIB = {
+    "A6000": 599,           # driver 595.91
+    "A5000": 450,           # driver 595.91
+    "RTX5090-LAPTOP": 326,  # driver 621.01
+    "V100-32GB": 274,       # driver 580.159
+}
+
 # Other spellings, after normalisation (see _norm), mapped to a preset.
 _ALIASES = {
     "RTXA6000": "A6000",
@@ -55,7 +66,7 @@ _ALIASES = {
     "V100SXM216GB": "V100-16GB",
 }
 
-NVIDIA_SMI_QUERY = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used",
+NVIDIA_SMI_QUERY = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.reserved,memory.used",
                     "--format=csv,noheader,nounits"]
 
 
@@ -71,11 +82,12 @@ def _norm(name: str) -> str:
 
 
 def gpu_total_bytes(name: str) -> int:
+    """Total memory as CUDA reports it, for a preset name."""
     key = _norm(name)
     key = _ALIASES.get(key, key)
     for k, mib in GPUS_MIB.items():
         if _norm(k) == _norm(key):
-            return mib * 2**20
+            return (mib - RESERVED_MIB.get(k, 0)) * 2**20
     raise ValueError(f"unknown GPU '{name}'. Known: {', '.join(GPUS_MIB)}, or 'auto' to read the local GPU "
                      "with nvidia-smi; for any other GPU pass --gpu-mem-gib with its total memory")
 
@@ -86,6 +98,12 @@ class DetectedGPU:
     name: str
     total_mib: int | None   # None when nvidia-smi prints N/A (e.g. unified-memory systems)
     used_mib: int | None
+    reserved_mib: int | None = None
+
+    @property
+    def cuda_total_mib(self) -> int | None:
+        """What CUDA (and so vLLM) reports as total memory."""
+        return None if self.total_mib is None else self.total_mib - (self.reserved_mib or 0)
 
 
 def _mib(field: str) -> int | None:
@@ -97,22 +115,23 @@ def _mib(field: str) -> int | None:
 
 
 def parse_nvidia_smi(text: str) -> list[DetectedGPU]:
-    """Parse `nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv,noheader,nounits`."""
+    """Parse the output of NVIDIA_SMI_QUERY (CSV without header or units)."""
     gpus = []
     for line in text.splitlines():
         if not line.strip():
             continue
         parts = line.split(",")
-        if len(parts) < 4:
+        if len(parts) < 5:
             raise GPUDetectError(f"unexpected nvidia-smi output line: {line.strip()!r}; pass --gpu NAME or "
                                  "--gpu-mem-gib instead")
-        # The name may itself contain commas; index is first, the two memory fields are last.
+        # The name may itself contain commas; index is first, the three memory fields are last.
         try:
             index = int(parts[0].strip())
         except ValueError:
             raise GPUDetectError(f"unexpected nvidia-smi output line: {line.strip()!r}; pass --gpu NAME or "
                                  "--gpu-mem-gib instead") from None
-        gpus.append(DetectedGPU(index, ",".join(parts[1:-2]).strip(), _mib(parts[-2]), _mib(parts[-1])))
+        gpus.append(DetectedGPU(index, ",".join(parts[1:-3]).strip(), _mib(parts[-3]), _mib(parts[-1]),
+                                _mib(parts[-2])))
     return gpus
 
 
@@ -154,7 +173,7 @@ def select_gpus(gpus: list[DetectedGPU], tp: int, indices: list[int] | None = No
             raise GPUDetectError(f"--gpu-index lists {len(indices)} GPU(s) but tensor_parallel_size is {tp}")
         chosen = [by_index[i] for i in indices]
     for g in chosen:
-        if g.total_mib is None or g.total_mib <= 0:
+        if g.cuda_total_mib is None or g.cuda_total_mib <= 0:
             raise GPUDetectError(f"nvidia-smi does not report the memory of GPU {g.index} ({g.name}); "
                                  "pass --gpu-mem-gib with its total memory")
     return chosen
