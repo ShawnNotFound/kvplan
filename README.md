@@ -49,6 +49,19 @@ kvplan inspect MODEL
 
 For the most precise result, give the GPU memory exactly as CUDA reports it (`--gpu-mem-gib`); the `--gpu` presets use the slightly larger `nvidia-smi` totals.
 
+On the machine that will run vLLM, `--gpu auto` reads the GPUs from `nvidia-smi`, including memory other processes already hold. vLLM reserves a fraction of *total* memory, so a desktop session on a laptop GPU or another job on a shared server can stop it from starting even when the model fits:
+
+```
+$ kvplan check Qwen/Qwen2.5-1.5B-Instruct --gpu auto
+...
+  gpu 0          NVIDIA GeForce RTX 5090 Laptop GPU: 24,463 MiB total, 4,478 MiB in use (nvidia-smi)
+  RESULT         vLLM will not start
+  error          gpu_memory_utilization=0.92 asks for 21.98 GiB, but only about 19.02 GiB is free after the CUDA context and other processes. ...
+  try            lower --gpu-memory-utilization to 0.79
+```
+
+With tensor parallelism it uses the first `-tp` GPUs, or the ones you name with `--gpu-index 2,3`.
+
 ```
 $ kvplan inspect openai/gpt-oss-20b
 openai/gpt-oss-20b

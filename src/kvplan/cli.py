@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 
 from . import __version__
-from .gpus import GPUS_MIB, gpu_total_bytes
+from .gpus import GPUS_MIB, gpu_total_bytes, query_nvidia_smi, select_gpus
 from .kv import kv_layout, resolve_kv_cache_dtype
 from .loader import load
 from .model import UnsupportedModel
@@ -36,8 +37,11 @@ def _parser() -> argparse.ArgumentParser:
     c = sub.add_parser("check", help="will this vLLM config start, and how much KV cache will it get?")
     model_args(c)
     gpu = c.add_mutually_exclusive_group(required=True)
-    gpu.add_argument("--gpu", help=f"GPU type ({', '.join(GPUS_MIB)})")
+    gpu.add_argument("--gpu", help=f"GPU type ({', '.join(GPUS_MIB)}), or 'auto' to read the local GPUs and "
+                                   "the memory other processes already use from nvidia-smi")
     gpu.add_argument("--gpu-mem-gib", type=float, help="exact total GPU memory in GiB, as CUDA reports it")
+    c.add_argument("--gpu-index", help="with --gpu auto: nvidia-smi index(es) of the GPU(s) to plan for, "
+                                       "comma-separated (default: the first tensor-parallel-size GPUs)")
     c.add_argument("-tp", "--tensor-parallel-size", type=int, default=1)
     c.add_argument("--max-model-len", type=int)
     c.add_argument("--max-num-seqs", type=int)
@@ -47,8 +51,9 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--block-size", type=int, help="KV block size (default: vLLM's backend default)")
     c.add_argument("--enforce-eager", action="store_true")
     c.add_argument("--no-async-scheduling", action="store_true", help="as vLLM's --no-async-scheduling")
-    c.add_argument("--other-gpu-mem-gib", type=float, default=0.0,
-                   help="memory already used on the GPU by other processes")
+    c.add_argument("--other-gpu-mem-gib", type=float,
+                   help="memory already used on the GPU by other processes (default: 0, or what nvidia-smi "
+                        "reports with --gpu auto)")
     c.add_argument("--overhead-gib", type=float,
                    help="replace the estimated activation + CUDA-graph + runtime overhead with this value")
 
@@ -96,31 +101,72 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+def _parse_indices(text: str | None) -> list[int] | None:
+    if text is None:
+        return None
+    try:
+        indices = [int(x) for x in text.split(",") if x.strip()]
+    except ValueError:
+        raise ValueError(f"--gpu-index must be comma-separated GPU numbers such as 0 or 0,1, "
+                         f"not '{text}'") from None
+    if not indices or any(i < 0 for i in indices) or len(set(indices)) != len(indices):
+        raise ValueError(f"--gpu-index must list distinct GPU numbers such as 0 or 0,1, not '{text}'")
+    return indices
+
+
+def _resolve_gpu(args) -> tuple[int, str, int, str, list]:
+    """(total bytes, GPU name, bytes used by other processes, description, detected GPUs)."""
+    for flag, v in (("--gpu-mem-gib", args.gpu_mem_gib), ("--other-gpu-mem-gib", args.other_gpu_mem_gib),
+                    ("--overhead-gib", args.overhead_gib)):
+        if v is not None and not math.isfinite(v):
+            raise ValueError(f"{flag} must be a number of GiB, not {v}")
+    other = int(args.other_gpu_mem_gib * GiB) if args.other_gpu_mem_gib is not None else 0
+    if args.gpu_index is not None and (args.gpu or "").lower() != "auto":
+        raise ValueError("--gpu-index only applies to --gpu auto")
+    if args.gpu_mem_gib is not None:
+        return int(args.gpu_mem_gib * GiB), "", other, f"{args.gpu_mem_gib} GiB GPU", []
+    if args.gpu.lower() != "auto":
+        return gpu_total_bytes(args.gpu), args.gpu, other, args.gpu, []
+    chosen = select_gpus(query_nvidia_smi(), args.tensor_parallel_size, _parse_indices(args.gpu_index))
+    # vLLM sizes every rank like the smallest GPU; the busiest GPU decides whether it starts.
+    total = min(g.total_mib for g in chosen) * 2**20
+    if args.other_gpu_mem_gib is None:
+        other = max(g.used_mib or 0 for g in chosen) * 2**20
+    names = sorted({g.name for g in chosen})
+    return total, names[0] if len(names) == 1 else "", other, " / ".join(names), chosen
+
+
 def cmd_check(args) -> int:
+    # Resolve the GPU first: a typo or a missing driver should fail before any network access.
+    total, gpu_name, other, gpu_desc, detected = _resolve_gpu(args)
     loaded = load(open_source(args.model, args.revision, args.token), gguf=args.gguf)
-    total = int(args.gpu_mem_gib * GiB) if args.gpu_mem_gib else gpu_total_bytes(args.gpu)
     cfg = ServeConfig(
         gpu_total_bytes=total, tp=args.tensor_parallel_size, max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs, max_num_batched_tokens=args.max_num_batched_tokens,
         gpu_memory_utilization=args.gpu_memory_utilization, kv_cache_dtype=args.kv_cache_dtype,
         block_size=args.block_size, enforce_eager=args.enforce_eager,
         async_scheduling=not args.no_async_scheduling,
-        other_process_bytes=int(args.other_gpu_mem_gib * GiB),
+        other_process_bytes=other,
         overhead_bytes=int(args.overhead_gib * GiB) if args.overhead_gib is not None else None,
-        gpu_name=args.gpu or "",
+        gpu_name=gpu_name,
     )
     cfg.validate()
     w = weight_bytes_per_rank(loaded.spec, loaded.tensors, cfg.tp)
     p = plan(loaded.spec, w, cfg, args.model)
     if args.json:
-        print(json.dumps(p.to_dict() | {"spec_notes": loaded.spec.notes}, indent=2))
+        extra = {"spec_notes": loaded.spec.notes, "other_process_bytes": other}
+        if detected:
+            extra["detected_gpus"] = [g.__dict__ for g in detected]
+        print(json.dumps(p.to_dict() | extra, indent=2))
         return 0 if p.starts else 1
 
-    gpu_desc = args.gpu or f"{args.gpu_mem_gib} GiB GPU"
     print(f"{args.model} on {cfg.tp} x {gpu_desc} "
           f"(max_model_len {p.max_model_len}, max_num_seqs {p.max_num_seqs}, "
           f"gpu_memory_utilization {cfg.gpu_memory_utilization})")
     print()
+    for g in detected:
+        used = "unknown" if g.used_mib is None else f"{g.used_mib:,} MiB"
+        print(f"  gpu {g.index:<10} {g.name}: {g.total_mib:,} MiB total, {used} in use (nvidia-smi)")
     print(f"  budget         {_gib(p.requested_bytes)} of {_gib(p.gpu_total_bytes)} per GPU")
     print(f"  weights        {_gib(w.per_rank_bytes)} per GPU (exact, from the weight files)")
     o = p.overheads

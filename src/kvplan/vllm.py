@@ -51,7 +51,13 @@ class ServeConfig:
 
     def validate(self) -> None:
         if self.gpu_total_bytes <= 0:
-            raise ValueError("GPU memory must be positive")
+            raise ValueError("GPU memory must be positive (check --gpu-mem-gib)")
+        if self.other_process_bytes < 0:
+            raise ValueError("--other-gpu-mem-gib cannot be negative")
+        if self.other_process_bytes >= self.gpu_total_bytes:
+            raise ValueError("--other-gpu-mem-gib is at least the GPU's total memory; check the value")
+        if self.overhead_bytes is not None and self.overhead_bytes < 0:
+            raise ValueError("--overhead-gib cannot be negative")
         if self.tp < 1:
             raise ValueError("--tensor-parallel-size must be at least 1")
         if not 0 < self.gpu_memory_utilization <= 1:
