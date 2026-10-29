@@ -11,18 +11,18 @@ unsloth/Meta-Llama-3.1-8B-Instruct on 1 x L4 (max_model_len 131072, max_num_seqs
 
   budget         20.69 GiB of 22.49 GiB per GPU
   weights        14.96 GiB per GPU (exact, from the weight files)
-  runtime        1.18 GiB estimated: activations 0.19 GiB, sampler logits 0.24 GiB, CUDA graphs 0.50 GiB, other 0.25 GiB
-  KV cache       4.55 GiB available (131,072 bytes per token per GPU, auto, block size 16)
-  capacity       37,312 tokens; max concurrency at 131,072 tokens per request: 0.28x
+  runtime        0.83 GiB estimated: activation peak 0.22 GiB, torch.compile 0.11 GiB, CUDA graphs 0.25 GiB, other 0.25 GiB
+  KV cache       4.91 GiB available (131,072 bytes per token per GPU, auto, block size 16)
+  capacity       40,208 tokens; max concurrency at 131,072 tokens per request: 0.31x
 
   RESULT         vLLM will not start
-  error          one request at max_model_len=131072 needs 16.00 GiB of KV cache, but only 4.55 GiB is available; vLLM's estimate of the longest length that fits is 37296
-  try            --max-model-len 37296 (or lower)
+  error          one request at max_model_len=131072 needs 16.00 GiB of KV cache, but only 4.91 GiB is available; vLLM's estimate of the longest length that fits is 40192
+  try            --max-model-len 40192 (or lower)
   try            --kv-cache-dtype fp8 halves the KV cache
   try            --tensor-parallel-size 2 on 2 GPUs splits weights and KV further
 ```
 
-> **Status: v0.1, alpha.** Weight and KV sizes are computed exactly from the model files. The runtime overheads (activation peak, sampler logits, CUDA graphs) are estimates that have not yet been checked against real vLLM startup logs, so treat the KV figure as approximate (roughly ±1 GiB) until the validation table below exists.
+> **Status: alpha.** Weight and KV sizes are computed exactly from the model files. The runtime overheads (activation peak, torch.compile buffers, CUDA graphs) are fitted to vLLM 0.32 startup logs from 15 runs on RTX A6000 and A5000 GPUs; see [Accuracy](#accuracy) for what that does and does not cover.
 
 ## Why
 
@@ -89,11 +89,11 @@ In a sample of the 300 most-downloaded text-generation models on Hugging Face, k
 
 ## Accuracy
 
-Not yet measured on GPUs. The plan: run vLLM on a few GPUs and models, record the "Available KV cache memory" and "Maximum concurrency" lines it prints at startup, and publish predicted against measured here. The target is within ±5% (or ±0.5 GiB) of vLLM's figure.
+Checked against vLLM 0.32.0 on an RTX A6000 and RTX A5000s with four dense models (Qwen2.5 1.5B, Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B), with and without CUDA graphs, at tensor parallelism 1 and 2. kvplan's KV-cache token count was within 0.7% of vLLM's in 14 of 15 runs and within 1.9% in all of them; before calibration (v0.1) it was within 2.7%. The calibration was fitted to these same runs, so these are in-sample numbers: other GPUs, vLLM versions, MoE and quantised models have not been measured yet. The full table, method and known gaps are in [docs/validation.md](docs/validation.md).
 
 ## Roadmap
 
-- v0.2: calibrated runtime overheads, a measurement script anyone can run on their GPU, PyPI release
+- v0.2: calibrated runtime overheads (done for dense models, see Accuracy), a measurement script anyone can run on their GPU, PyPI release
 - v0.3: llama.cpp profile, published validation table
 - v0.4: `place`: several models across several machines with mixed GPUs
 
