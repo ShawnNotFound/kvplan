@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kvplan"
+version = "0.1.0"
+description = "Plan vLLM deployments without the GPU: will it start, how much KV cache, how many users."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Shawn (Shuaijie Shao)" }]
+keywords = ["vllm", "llm", "gpu", "memory", "kv-cache", "inference"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+kvplan = "kvplan.cli:main"
+
+[project.urls]
+Repository = "https://github.com/ShawnNotFound/kvplan"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kvplan"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["network: needs access to huggingface.co (deselect with -m 'not network')"]

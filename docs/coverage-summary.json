@@ -1,0 +1,49 @@
+[
+ {
+  "sample": "A",
+  "n": 300,
+  "config_only_%": 68.3,
+  "with_fallbacks_%": 93.3,
+  "token_needed_%": 4.3,
+  "with_token_%": 97.7,
+  "not_coverable_%": 2.3,
+  "counts": {
+   "config": 205,
+   "gguf_header": 73,
+   "gated_token_needed": 13,
+   "not_coverable": 7,
+   "shape_fallback": 2
+  },
+  "dl_weighted_with_fallbacks_%": 94.8,
+  "dl_weighted_with_token_%": 98.7
+ },
+ {
+  "sample": "B",
+  "n": 200,
+  "config_only_%": 52.5,
+  "with_fallbacks_%": 92.5,
+  "token_needed_%": 4.0,
+  "with_token_%": 96.5,
+  "not_coverable_%": 3.5,
+  "counts": {
+   "config": 105,
+   "gguf_header": 80,
+   "gated_token_needed": 8,
+   "not_coverable": 7
+  }
+ },
+ {
+  "sample": "C",
+  "n": 100,
+  "config_only_%": 10.0,
+  "with_fallbacks_%": 98.0,
+  "token_needed_%": 0.0,
+  "with_token_%": 98.0,
+  "not_coverable_%": 2.0,
+  "counts": {
+   "gguf_header": 88,
+   "not_coverable": 2,
+   "config": 10
+  }
+ }
+]

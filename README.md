@@ -1,0 +1,89 @@
+# kvplan
+
+Plan vLLM deployments without the GPU.
+
+Tell kvplan a model, your GPUs and your vLLM settings. It tells you whether vLLM will start, how much KV cache you will get, and how many full-length requests fit at once. It reads the model's real files from Hugging Face (only the headers, never the weights), so it works for new models the day they are uploaded.
+
+```
+$ kvplan check unsloth/Meta-Llama-3.1-8B-Instruct --gpu L4
+
+unsloth/Meta-Llama-3.1-8B-Instruct on 1 x L4 (max_model_len 131072, max_num_seqs 256, gpu_memory_utilization 0.92)
+
+  budget         20.69 GiB of 22.49 GiB per GPU
+  weights        14.96 GiB per GPU (exact, from the weight files)
+  runtime        1.18 GiB estimated: activations 0.19 GiB, sampler logits 0.24 GiB, CUDA graphs 0.50 GiB, other 0.25 GiB
+  KV cache       4.55 GiB available (131,072 bytes per token per GPU, auto, block size 16)
+  capacity       37,312 tokens; max concurrency at 131,072 tokens per request: 0.28x
+
+  RESULT         vLLM will not start
+  error          one request at max_model_len=131072 needs 16.00 GiB of KV cache, but only 4.55 GiB is available; vLLM's estimate of the longest length that fits is 37296
+  try            --max-model-len 37296 (or lower)
+  try            --kv-cache-dtype fp8 halves the KV cache
+  try            --tensor-parallel-size 2 on 2 GPUs splits weights and KV further
+```
+
+> **Status: v0.1, alpha.** Weight and KV sizes are computed exactly from the model files. The runtime overheads (activation peak, sampler logits, CUDA graphs) are estimates that have not yet been checked against real vLLM startup logs, so treat the KV figure as approximate (roughly ±1 GiB) until the validation table below exists.
+
+## Why
+
+vLLM decides its KV cache size at startup, on the real GPU: it reserves `gpu_memory_utilization` of the **total** GPU memory, loads the weights, profiles a forward pass, and gives whatever is left to the KV cache. If one request at `max_model_len` doesn't fit, it refuses to start. You find this out after renting or buying the GPU.
+
+Other tools approximate this with parameter count × bytes per parameter plus a fixed overhead. That misses quantisation scales, padded vocabularies, tied embeddings, sliding-window layers, latent (MLA) caches and how tensor parallelism splits or replicates KV heads. kvplan reproduces vLLM's own accounting instead. See [docs/accounting.md](docs/accounting.md) for every rule and the vLLM source it comes from.
+
+## Install
+
+```
+pip install git+https://github.com/ShawnNotFound/kvplan
+```
+
+No dependencies beyond Python 3.10+. For gated models (Llama, Gemma), set `HF_TOKEN` or run `huggingface-cli login`.
+
+## Use
+
+```
+kvplan check MODEL (--gpu NAME | --gpu-mem-gib GIB) [vLLM options]
+kvplan inspect MODEL
+```
+
+`MODEL` is a Hugging Face repo id or a local directory or file. `check` understands the vLLM options that change memory: `-tp/--tensor-parallel-size`, `--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--block-size`, `--enforce-eager`. Add `--json` for scripts and CI; the exit code is 0 when vLLM should start and 1 when it won't.
+
+For the most precise result, give the GPU memory exactly as CUDA reports it (`--gpu-mem-gib`); the `--gpu` presets use the slightly larger `nvidia-smi` totals.
+
+```
+$ kvplan inspect openai/gpt-oss-20b
+openai/gpt-oss-20b
+  architecture   gpt_oss (read from config)
+  layers         24: 12 sliding, 12 full (window 128)
+  attention      64 heads, 8 KV heads, head_dim 64
+  experts        32 (all resident in GPU memory)
+  context        131072
+  KV per token   49,152 bytes per GPU at tp=1 (auto)
+  weights        12.82 GiB per GPU at tp=1 (checkpoint 12.82 GiB in 3 file(s))
+```
+
+## What it covers
+
+| | |
+|---|---|
+| Model metadata | config.json (including multimodal `text_config`), safetensors headers, GGUF headers, with a tensor-shape fallback when config.json lacks fields |
+| Attention | MHA, GQA, MQA, sliding-window and hybrid full/sliding layouts (Gemma 2/3, gpt-oss, Cohere2, Qwen2/3 with sliding window), MLA (DeepSeek V2/V3, Kimi K2) |
+| Weights | exact bytes per tensor, 16-bit loading of fp32 checkpoints, quantised formats at their stored size, vocab padding, tied embeddings, MTP layers excluded, tensor-parallel sharding and KV-head replication |
+| vLLM | utilisation budget, free-memory check, KV block grouping and rounding, max concurrency, the max_model_len check and its suggested length |
+
+In a sample of the 300 most-downloaded text-generation models on Hugging Face, kvplan's sources describe 93% without a token and 98% with one (details in [docs/coverage.md](docs/coverage.md)).
+
+**Not yet supported:** models with Mamba or linear-attention layers (Qwen3-Next, Jamba, Nemotron-H, Falcon-H1), DeepSeek V3.2 sparse attention, encoder-decoder models, pipeline/expert/data parallelism, LoRA, speculative decoding, and llama.cpp. kvplan says so instead of guessing.
+
+## Accuracy
+
+Not yet measured on GPUs. The plan: run vLLM on a few GPUs and models, record the "Available KV cache memory" and "Maximum concurrency" lines it prints at startup, and publish predicted against measured here. The target is within ±5% (or ±0.5 GiB) of vLLM's figure.
+
+## Roadmap
+
+- v0.2: calibrated runtime overheads, a measurement script anyone can run on their GPU, PyPI release
+- v0.3: llama.cpp profile, published validation table
+- v0.4: `place`: several models across several machines with mixed GPUs
+
+## Licence
+
+Apache-2.0
