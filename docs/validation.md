@@ -151,6 +151,31 @@ With the "start not confirmed" verdict, 3 of the 140 models that kvplan sizes mo
 
 The RoPE cache and the non-torch change also move the earlier rows. In-sample text runs: within -1.23% to +1.83% (mean absolute error 0.51%; was 0.42%): the A5000 Llama rows move from -0.5/-0.3% to -1.2/-1.0%, the rest by less than 0.3 points. The 2× A6000 runs: Llama 3.1 8B -0.22% / +0.03%, Qwen2.5-VL 7B +0.31% (graphs) / -0.51% (eager), Qwen2.5-Omni 7B +0.03%.
 
+## MoE and quantised checkpoints (2026-10-30, third round)
+
+Twelve runs of four small models downloaded for this (7.6 GB in total): IBM Granite 3.1 1B-A400M (MoE, 32 experts), Qwen2.5-1.5B-Instruct AWQ and GPTQ-Int4, and Qwen3-1.7B-FP8 (block-quantised fp8 weights, which vLLM runs through Marlin on Ampere). vLLM 0.32.0, `LLM()` with 8192 batched tokens, max_model_len 4096 unless stated, CUDA graphs unless stated. None of these runs were used to fit anything. Results with the current kvplan:
+
+| GPU | Model | Mode | TP | Weights GiB (vLLM / kvplan) | KV cache GiB (vLLM / kvplan) | KV tokens (vLLM / kvplan) | Error |
+|---|---|---|---|---|---|---|---|
+| RTX A6000 | ibm-granite/granite-3.1-1b-a400m-instruct | CUDA graphs | 1 | 2.50 / 2.50 | 39.32 / 39.27 | 858,864 / 857,808 | -0.12% |
+| RTX A6000 | ibm-granite/granite-3.1-1b-a400m-instruct (max_model_len 8192) | eager | 1 | 2.50 / 2.50 | 39.66 / 39.63 | 866,288 / 865,664 | -0.07% |
+| RTX A5000 | ibm-granite/granite-3.1-1b-a400m-instruct | CUDA graphs | 1 | 2.50 / 2.50 | 17.85 / 17.80 | 390,032 / 388,896 | -0.29% |
+| 2× RTX A6000 | ibm-granite/granite-3.1-1b-a400m-instruct | CUDA graphs | 2 | 1.26 / 1.26 | 40.65 / 40.66 | 1,775,808 / 1,776,384 | +0.03% |
+| RTX A6000 | Qwen/Qwen2.5-1.5B-Instruct-AWQ | CUDA graphs | 1 | 1.10 / 1.08 | 40.47 / 40.37 | 1,515,424 / 1,511,904 | -0.23% |
+| RTX A5000 | Qwen/Qwen2.5-1.5B-Instruct-AWQ | CUDA graphs | 1 | 1.10 / 1.08 | 19.01 / 18.91 | 711,776 / 708,048 | -0.52% |
+| 2× RTX A6000 | Qwen/Qwen2.5-1.5B-Instruct-AWQ | CUDA graphs | 2 | 0.55 / 0.54 | 41.32 / 41.26 | 3,094,912 / 3,090,448 | -0.14% |
+| RTX A6000 | Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4 | CUDA graphs | 1 | 1.10 / 1.08 | 40.45 / 40.37 | 1,514,976 / 1,511,824 | -0.21% |
+| RTX A5000 | Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4 | CUDA graphs | 1 | 1.10 / 1.08 | 19.00 / 18.91 | 711,344 / 707,984 | -0.47% |
+| RTX A6000 | Qwen/Qwen3-1.7B-FP8 | CUDA graphs | 1 | 1.92 / 1.90 | 39.48 / 39.66 | 369,600 / 371,344 | +0.47% |
+| RTX A5000 | Qwen/Qwen3-1.7B-FP8 | CUDA graphs | 1 | 1.92 / 1.90 | 18.02 / 18.20 | 168,688 / 170,384 | +1.01% |
+| RTX A5000 | Qwen/Qwen3-1.7B-FP8 | eager | 1 | 1.92 / 1.90 | 18.59 / 18.67 | 174,080 / 174,768 | +0.40% |
+
+All twelve are within 1.01% (mean absolute error 0.33%).
+
+- **Bug found:** the AWQ and FP8 checkpoints store `lm_head.weight` although `tie_word_embeddings` is set. vLLM ties `lm_head` to the embedding and does not load the stored copy; kvplan counted it, so its weights were up to 0.58 GiB high and the KV figure up to 2.8% low (AWQ on the A5000). The table shows the fixed result. On the ungated models of today's top-300 Hugging Face text-generation list (2 × H100-80GB, TP 2; 175 of 287 sized, the rest unsupported architectures or not reachable), the fix changes 8 models, all by 0.15–0.37 GiB less weight per GPU and at most 0.5% more KV tokens: Qwen3 0.6B and 1.7B (also the base bf16 checkpoints store `lm_head.weight`) and two fine-tunes of them, Qwen3Guard-Gen 0.6B, Qwen3-4B-Instruct-2507-FP8, Qwen2.5-3B-Instruct-AWQ and Llama-3.2-3B-Instruct-FP8-dynamic. No start/no-start verdict changes.
+- The runtime terms do not match one by one: the profiled peak is 0.43–0.44 GiB for the MoE model with CUDA graphs (kvplan 0.28 GiB) but 0.09 GiB in eager mode, and 0.83–0.98 GiB for the quantised models with CUDA graphs (kvplan 0.38–0.55 GiB), while kvplan's CUDA-graph term is a little high. The totals agree to within 1%, so the fit is unchanged, and kvplan still notes that its runtime figures for MoE models are a rough estimate.
+- **fp8 KV cache on Ampere:** six runs with `kv_cache_dtype="fp8"` (Qwen2.5 1.5B, Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B, Granite MoE; A6000 and A5000) all failed at startup. The default FlashInfer backend could not build its fp8 kernels for compute capability 8.6, and the Triton backend refuses: "FP8 KV cache is not supported by the Triton attention backend on NVIDIA RTX A6000 (compute capability 8.6); native FP8 (fp8e4nv) requires SM89+". kvplan now gives "start not confirmed" for an fp8 KV cache on a GPU it knows to be older than compute capability 8.9, and no longer suggests `--kv-cache-dtype fp8` there. The KV size of an fp8 cache is still unmeasured.
+
 ## What the measurements changed
 
 - **Total memory.** vLLM's total is `nvidia-smi`'s `memory.total` minus `memory.reserved` (A6000: 49140 − 599 MiB = 47.40 GiB; A5000: 24564 − 450 MiB = 23.55 GiB), not `memory.total`. With the plain total, kvplan's budget was about 0.5 GiB too large on an A6000 (around +1.5% KV tokens there).
@@ -165,7 +190,7 @@ Gemma 2 alternates full-attention and 4096-token sliding-window layers. vLLM 0.3
 
 - Gemma 2 with CUDA graphs: the compiled peak is 0.45 GiB above the fit (+1.8% KV tokens); its non-torch memory is also about 0.15 GiB above the 0.25 GiB kvplan assumes.
 - Multimodal models: the encoder pass is derived for the Qwen2.5-VL / Qwen2.5-Omni vision tower only; Whisper-style audio is approximate (25% low) and other encoders (MiniCPM-o, Gemma 3, Llava, InternVL, ...) are not sized: kvplan warns. The extra 0.20 GiB of non-torch memory for multimodal models is a fitted constant.
-- Not measured: MoE models (kvplan falls back to the older estimate and says so), MLA models, quantised checkpoints, fp8 KV cache, Hopper or Blackwell GPUs, more than 2 GPUs, and `vllm serve` itself (its defaults differ only in batch size, which the 2048-token rows cover).
+- Not measured: MoE models larger than Granite 1B-A400M, MLA models, quantised checkpoints other than AWQ, GPTQ and fp8 block quantisation at 1.5–1.7B, the size of an fp8 KV cache (it does not start on the Ampere GPUs used here), Hopper or Blackwell GPUs, more than 2 GPUs, and `vllm serve` itself (its defaults differ only in batch size, which the 2048-token rows cover).
 - Tesla V100: vLLM 0.32's CUDA 13 wheels do not run on compute capability 7.0 ("no kernel image is available for execution on the device"), so no V100 numbers.
 - The CUDA context before vLLM's snapshot measured 0.21–0.46 GiB; kvplan keeps 0.5 GiB for the start check so that it errs towards "will not start".
 

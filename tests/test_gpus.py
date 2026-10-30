@@ -5,7 +5,8 @@ import pytest
 
 from helpers import llama_like_tensors, write_model_dir
 from kvplan import cli
-from kvplan.gpus import (GPUS_MIB, RESERVED_MIB, GPUDetectError, DetectedGPU, gpu_total_bytes, parse_nvidia_smi,
+from kvplan.gpus import (GPUS_MIB, RESERVED_MIB, GPUDetectError, DetectedGPU, compute_capability, gpu_total_bytes,
+                         parse_nvidia_smi,
                          query_nvidia_smi, select_gpus)
 
 MiB = 2**20
@@ -155,3 +156,11 @@ def test_auto_without_driver_fails_cleanly(monkeypatch, capsys, model_dir):
     monkeypatch.setattr(cli, "query_nvidia_smi", missing)
     assert cli.main(["check", model_dir, "--gpu", "auto"]) == 2
     assert "nvidia-smi" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name, cc", [
+    ("A6000", (8, 6)), ("NVIDIA RTX A6000", (8, 6)), ("NVIDIA GeForce RTX 4090", (8, 9)), ("H100-80GB", (9, 0)),
+    ("Tesla V100-PCIE-32GB", (7, 0)), ("Some Future GPU", None),
+])
+def test_compute_capability(name, cc):
+    assert compute_capability(name) == cc

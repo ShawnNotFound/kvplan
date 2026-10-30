@@ -209,7 +209,7 @@ def cmd_check(args) -> int:
     print()
     result = p.verdict
     if p.starts is None:
-        result += ": kvplan could not size " + "; ".join(p.unconfirmed)
+        result += ": kvplan could not check " + "; ".join(p.unconfirmed)
         if p.start_margin_bytes is not None:
             result += f". Under kvplan's estimates {_gib(max(p.start_margin_bytes, 0))} would be left at the start check"
             if any("encoder" in u for u in p.unconfirmed):

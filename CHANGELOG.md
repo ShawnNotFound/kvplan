@@ -3,6 +3,10 @@
 ## Unreleased
 
 - The RoPE cache note is left out when it would read 0.00 GiB (small models). The cache is still counted with the weights.
+- Tied models whose checkpoint still stores `lm_head.weight` (Qwen3 0.6B and 1.7B, Qwen's AWQ and FP8 releases) no longer count it: vLLM does not load it. kvplan's weights for these were up to 0.58 GiB high.
+- An fp8 KV cache on a GPU older than compute capability 8.9 (A100, A6000, A5000, RTX 3090, T4, V100) gives "start not confirmed": vLLM 0.32 failed to start with it on RTX A6000 and A5000. kvplan no longer suggests `--kv-cache-dtype fp8` on those GPUs.
+- "start not confirmed" now reads "kvplan could not check ..." instead of "could not size ...".
+- Validated on MoE and quantised checkpoints (Granite MoE, AWQ, GPTQ, fp8 weights): 12 runs within 1.01%; see docs/validation.md.
 
 ## 0.1.0 (2026-10-30)
 

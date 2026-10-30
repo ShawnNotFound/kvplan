@@ -90,7 +90,12 @@ def weight_bytes_per_rank(spec: ModelSpec, tensors: list[Tensor], tp: int = 1) -
         raise ValueError("--tensor-parallel-size must be at least 1")
     dtype_bytes = spec.model_dtype_bytes
     names = {t.name for t in tensors}
+    has_embed = any(_EMBED.search(n) for n in names)
     tied = not any(_LM_HEAD.search(n) for n in names)
+    # Some checkpoints of tied models (Qwen's AWQ and FP8 releases) still store lm_head.weight. vLLM
+    # ties lm_head to the embedding's parameter when tie_word_embeddings is set (lm_head.tie_weights in
+    # vllm/model_executor/models/qwen2.py) and AutoWeightsLoader skips the alias (models/utils.py).
+    skip_lm_head = spec.tie_word_embeddings and has_embed and not tied
     notes: list[str] = []
 
     per_rank = 0.0
@@ -104,6 +109,10 @@ def weight_bytes_per_rank(spec: ModelSpec, tensors: list[Tensor], tp: int = 1) -
     for t in tensors:
         if _NOT_LOADED.search(t.name):
             skipped += t.nbytes
+            continue
+        if skip_lm_head and _LM_HEAD.search(t.name):
+            skipped += t.nbytes
+            notes.append("lm_head is tied to the embedding; the stored lm_head.weight is not loaded")
             continue
         if drop and t.name.startswith(drop):
             skipped += t.nbytes
@@ -166,7 +175,7 @@ def weight_bytes_per_rank(spec: ModelSpec, tensors: list[Tensor], tp: int = 1) -
         embedding_bytes=embedding,
         replicated_bytes=replicated,
         skipped_bytes=skipped,
-        tied=tied,
+        tied=tied or skip_lm_head,
         notes=sorted(set(notes)),
         buffer_bytes=buffers,
     )

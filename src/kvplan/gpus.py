@@ -45,6 +45,17 @@ GPUS_MIB = {
     "V100-16GB": 16384,
 }
 
+# CUDA compute capability. vLLM's FP8 KV-cache kernels need 8.9 (Ada) or newer.
+COMPUTE_CAPABILITY = {
+    "H200": (9, 0), "H100-80GB": (9, 0), "H100-94GB": (9, 0),
+    "A100-80GB": (8, 0), "A100-40GB": (8, 0),
+    "L40S": (8, 9), "L40": (8, 9), "RTX6000-ADA": (8, 9), "L4": (8, 9), "RTX4090": (8, 9), "RTX4080": (8, 9),
+    "A6000": (8, 6), "A5000": (8, 6), "A10G": (8, 6), "A10": (8, 6), "RTX3090": (8, 6),
+    "RTX5090-LAPTOP": (12, 0),
+    "T4": (7, 5),
+    "V100-32GB": (7, 0), "V100-16GB": (7, 0),
+}
+
 # Driver-reserved memory (nvidia-smi "memory.reserved"), read on the real GPU.
 RESERVED_MIB = {
     "A6000": 599,           # driver 595.91
@@ -90,6 +101,16 @@ def gpu_total_bytes(name: str) -> int:
             return (mib - RESERVED_MIB.get(k, 0)) * 2**20
     raise ValueError(f"unknown GPU '{name}'. Known: {', '.join(GPUS_MIB)}, or 'auto' to read the local GPU "
                      "with nvidia-smi; for any other GPU pass --gpu-mem-gib with its total memory")
+
+
+def compute_capability(name: str) -> tuple[int, int] | None:
+    """Compute capability for a preset or nvidia-smi name, or None when kvplan does not know the GPU."""
+    key = _norm(name)
+    key = _ALIASES.get(key, key)
+    for k, cc in COMPUTE_CAPABILITY.items():
+        if _norm(k) == _norm(key):
+            return cc
+    return None
 
 
 @dataclass(frozen=True)

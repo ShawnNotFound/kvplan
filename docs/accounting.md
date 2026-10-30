@@ -63,7 +63,7 @@ Batch defaults follow `EngineArgs.get_batch_defaults` (`vllm/engine/arg_utils.py
 Read from safetensors headers (exact byte ranges) or GGUF tensor offsets. Per tensor:
 
 - Unquantised floating-point weights are held in 16 bit (vLLM's `dtype="auto"` runs fp32 checkpoints in 16 bit). Quantised weights and their scales keep their stored size.
-- Embedding and `lm_head` are vocab-parallel: rows are padded to a multiple of 64 (`vllm/model_executor/layers/vocab_parallel_embedding.py` `pad_vocab_size`) and split over TP ranks. A checkpoint without `lm_head` is tied and stored once.
+- Embedding and `lm_head` are vocab-parallel: rows are padded to a multiple of 64 (`vllm/model_executor/layers/vocab_parallel_embedding.py` `pad_vocab_size`) and split over TP ranks. A checkpoint without `lm_head` is tied and stored once. When `tie_word_embeddings` is set but the checkpoint still stores `lm_head.weight` (Qwen's AWQ and FP8 releases), vLLM ties `lm_head` to the embedding (`lm_head.tie_weights` in `vllm/model_executor/models/qwen2.py`) and skips the stored copy (`AutoWeightsLoader` in `models/utils.py`), so kvplan does not count it.
 - K and V projections: split over TP ranks, unless there are fewer KV heads than ranks, in which case each rank holds one whole head (`vllm/model_executor/layers/linear.py` `QKVParallelLinear`, `num_kv_head_replicas`).
 - Replicated on every rank: 1-D tensors (norms, biases), MoE routers, MLA's `q_a_proj` and `kv_a_proj_with_mqa`.
 - Everything else (attention and MLP matrices, experts) is split 1/tp.
@@ -103,6 +103,7 @@ If the config's `layer_types` lists per-layer types, vLLM follows them (`vllm/mo
 - Maximum length: the smallest of `max_position_embeddings`, `n_positions`, `max_seq_len`, `seq_length`, `model_max_length`, `max_target_positions`, `max_sequence_length`, `max_seq_length`, `seq_len`, capped by the tokenizer's `model_max_length`, multiplied by the RoPE scaling factor unless the RoPE type already states the scaled length (su, longrope, llama3, yarn, deepseek_yarn, deepseek_llama_scaling) or the model is Gemma 3 (`vllm/config/model.py` `_get_and_verify_max_len`).
 - Default `max_model_len`: that maximum, except LongRoPE models, which default to `original_max_position_embeddings`.
 - `--kv-cache-dtype auto`: the model's 16-bit type, unless a modelopt `quantization_config` sets an fp8 KV cache (`vllm/utils/torch_utils.py` `resolve_kv_cache_dtype_string`).
+- An fp8 KV cache needs compute capability 8.9 or newer on vLLM 0.32's Triton backend (`vllm/v1/attention/backends/triton_attn.py`); FlashAttention 2 has no fp8 KV path, and FlashInfer's fp8 kernels failed to build on RTX A6000 and A5000 (8.6). For a GPU kvplan knows to be older than 8.9, an fp8 KV cache gives "start not confirmed".
 - MLA models use 64-token blocks (FlashMLA) or 128 on Blackwell (CUTLASS MLA); other models 16.
 
 ## 7. Blocks, groups and capacity

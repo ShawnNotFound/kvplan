@@ -26,6 +26,7 @@ import math
 from dataclasses import asdict, dataclass, field
 
 from . import mm
+from .gpus import compute_capability
 from .kv import KVCapacity, kv_capacity, kv_layout, resolve_kv_cache_dtype
 from .model import ModelSpec
 from .vllm_architectures import VLLM_ARCHITECTURES
@@ -212,7 +213,7 @@ class Plan:
     checks: list[Check] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
     verdict: str = VERDICT_STARTS
-    unconfirmed: list[str] = field(default_factory=list)   # the terms kvplan could not size
+    unconfirmed: list[str] = field(default_factory=list)   # the terms kvplan could not check
     start_margin_bytes: int | None = None   # memory to spare at the start check under kvplan's estimates
 
     def to_dict(self) -> dict:
@@ -265,6 +266,16 @@ def plan(spec: ModelSpec, weights: WeightBreakdown, cfg: ServeConfig, model_name
                         "--limit-mm-per-prompt (e.g. '{\"video\": 0}') or --mm-processor-kwargs "
                         "'{\"max_pixels\": ...}' shrink what vLLM profiles",
                         measure_once]
+    cc = compute_capability(cfg.gpu_name) if cfg.gpu_name else None
+    fp8_kv_unsupported = cc is not None and cc < (8, 9)
+    if fp8_kv_unsupported and resolve_kv_cache_dtype(spec, cfg.kv_cache_dtype).startswith("fp8"):
+        # vLLM 0.32's Triton backend refuses an FP8 KV cache below SM89 (triton_attn.py), FlashAttention 2
+        # has no FP8 KV path, and FlashInfer's FP8 kernels failed to build on RTX A6000 and A5000.
+        unconfirmed.append(f"the fp8 KV cache on compute capability {cc[0]}.{cc[1]}")
+        checks.append(Check(True, "warning", f"UNCERTAIN: vLLM 0.32 needs compute capability 8.9 or newer for an "
+                                             f"fp8 KV cache on most backends, and this GPU has {cc[0]}.{cc[1]}; on "
+                                             "RTX A6000 and A5000 it failed to start with every backend tried"))
+        suggestions.append("--kv-cache-dtype auto, which keeps the KV cache in the model's 16-bit dtype")
     if spec.num_kv_heads < tp and not spec.is_mla and spec.source != "tensor shapes":
         checks.append(Check(True, "info", f"only {spec.num_kv_heads} KV heads for {tp} GPUs: each GPU keeps a "
                                           "replicated head, so KV memory does not shrink further with more GPUs"))
@@ -349,13 +360,14 @@ def plan(spec: ModelSpec, weights: WeightBreakdown, cfg: ServeConfig, model_name
                                 f"measured with an encoder kvplan cannot size was "
                                 f"{_gib(LARGEST_MEASURED_ENCODER_PEAK)} (MiniCPM-o 2.6)"))
     if memory_short:
-        if resolve_kv_cache_dtype(spec, cfg.kv_cache_dtype) == "auto" and weights.per_rank_bytes < requested:
+        if (resolve_kv_cache_dtype(spec, cfg.kv_cache_dtype) == "auto" and weights.per_rank_bytes < requested
+                and not fp8_kv_unsupported):
             suggestions.append("--kv-cache-dtype fp8 halves the KV cache")
         if spec.source == "tensor shapes" or spec.num_heads % (tp * 2) == 0:
             suggestions.append(f"--tensor-parallel-size {tp * 2} on {tp * 2} GPUs splits weights and KV further")
     elif no_errors and cap is not None and cap.max_concurrency < 1.5:
-        suggestions.append("fewer than 2 full-length requests fit at once; consider a lower --max-model-len "
-                           "or --kv-cache-dtype fp8 for more concurrency")
+        suggestions.append("fewer than 2 full-length requests fit at once; consider a lower --max-model-len"
+                           + ("" if fp8_kv_unsupported else " or --kv-cache-dtype fp8") + " for more concurrency")
 
     return Plan(
         model=model_name, tp=tp, gpu_total_bytes=cfg.gpu_total_bytes, requested_bytes=requested, weights=weights,

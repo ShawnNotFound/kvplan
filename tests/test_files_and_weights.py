@@ -92,6 +92,18 @@ def test_tp_split_and_kv_replication(tmp_path):
     assert w4.per_rank_bytes == norms + emb4 + (q_o + mlp) // 4 + kv // 2
 
 
+def test_stored_lm_head_of_a_tied_model_is_not_loaded(tmp_path):
+    # Qwen's AWQ and FP8 checkpoints store lm_head.weight although tie_word_embeddings is set;
+    # vLLM skips it and reuses the embedding.
+    cfg = dict(CFG, tie_word_embeddings=True)
+    t = llama_like_tensors(layers=2, hidden=64, heads=8, kv_heads=2, inter=128, vocab=1000)
+    m = load(LocalSource(write_model_dir(tmp_path / "m", cfg, t)))
+    w = weight_bytes_per_rank(m.spec, m.tensors)
+    untied = weight_bytes_per_rank(load(LocalSource(write_model_dir(tmp_path / "u", CFG, t))).spec, m.tensors)
+    assert w.tied and w.skipped_bytes == 1000 * 64 * 2
+    assert untied.per_rank_bytes - w.per_rank_bytes == 1024 * 64 * 2   # the padded lm_head
+
+
 def test_tiny_rope_cache_is_counted_without_a_note(tmp_path):
     cfg = dict(CFG, rope_theta=10000.0)
     t = llama_like_tensors(layers=2, hidden=64, heads=8, kv_heads=2, inter=128, vocab=1000)

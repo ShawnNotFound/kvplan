@@ -162,3 +162,21 @@ def test_real_model_matches_hand_calculation():
     assert (m.spec.num_layers, m.spec.num_kv_heads, m.spec.head_dim) == (24, 2, 64)
     w = weight_bytes_per_rank(m.spec, m.tensors)
     assert 0.9 * GiB < w.per_rank_bytes < 1.0 * GiB
+
+
+def test_fp8_kv_cache_before_sm89_is_not_confirmed():
+    cfg = ServeConfig(gpu_total_bytes=47 * GiB, max_model_len=4096, kv_cache_dtype="fp8", gpu_name="A6000")
+    p = plan(LLAMA_8B, weights(15), cfg)
+    # vLLM 0.32 failed to start with an fp8 KV cache on RTX A6000 and A5000 (compute capability 8.6).
+    assert p.starts is None and p.unconfirmed == ["the fp8 KV cache on compute capability 8.6"]
+    assert any(s.startswith("--kv-cache-dtype auto") for s in p.suggestions)
+    cfg.gpu_name = "L4"
+    assert plan(LLAMA_8B, weights(15), cfg).starts
+
+
+def test_no_fp8_kv_suggestion_before_sm89():
+    cfg = ServeConfig(gpu_total_bytes=24 * GiB, overhead_bytes=GiB, gpu_name="NVIDIA RTX A5000")
+    p = plan(LLAMA_8B, weights(15), cfg)
+    assert not p.starts and not any("fp8" in s for s in p.suggestions)
+    cfg.gpu_name = "L4"
+    assert any("fp8" in s for s in plan(LLAMA_8B, weights(15), cfg).suggestions)

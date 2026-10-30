@@ -96,8 +96,9 @@ Checked against vLLM 0.32.0 on RTX A6000 and RTX A5000 GPUs.
 
 - **Text models** (Qwen2.5 1.5B, Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B; CUDA graphs and eager; tensor parallelism 1 and 2): kvplan's KV-cache token count is within 1.9% of vLLM's in all 15 runs (mean 0.5%). These runs were used for calibration, so they are in-sample. On two RTX A6000s at tensor parallelism 2, which were not used, Llama 3.1 8B is within 0.22%.
 - **Multimodal models:** kvplan reproduces the dummy images and videos vLLM profiles at startup for Qwen2-VL, Qwen2.5-VL and Qwen2.5-Omni, including the effect of `--mm-processor-kwargs` max_pixels and `--limit-mm-per-prompt`, and derives the vision encoder's memory from vLLM's code. On 16 fit runs (Qwen2.5-VL 7B, Qwen2.5-Omni 3B and 7B, Qwen2-Audio 7B on an A6000) it is within 0.72%; on 11 held-out runs (A5000, tensor parallelism 2) within 2.24%. Other encoders are not sized: for MiniCPM-o 2.6 kvplan was 19–23% high, and it now warns that the figure is uncertain for any encoder it cannot size.
+- **MoE and quantised models:** on 12 runs of Granite 3.1 1B-A400M (MoE), Qwen2.5 1.5B AWQ and GPTQ, and Qwen3 1.7B FP8, none of them used for fitting, kvplan is within 1.01% (mean 0.33%). An fp8 KV cache did not start on the RTX A6000 or A5000 (compute capability 8.6) with vLLM 0.32, so kvplan says "start not confirmed" for it on GPUs older than 8.9.
 
-Not measured yet: MoE and quantised models, other vLLM versions, Hopper or Blackwell GPUs. The full table, method and known gaps are in [docs/validation.md](https://github.com/ShawnNotFound/kvplan/blob/master/docs/validation.md).
+Not measured yet: large MoE and MLA models, the size of an fp8 KV cache, other vLLM versions, Hopper or Blackwell GPUs. The full table, method and known gaps are in [docs/validation.md](https://github.com/ShawnNotFound/kvplan/blob/master/docs/validation.md).
 
 ## Roadmap
 
