@@ -91,7 +91,7 @@ In a sample of the 300 most-downloaded text-generation models on Hugging Face, k
 
 ## Accuracy
 
-Checked against vLLM 0.32.0 on an RTX A6000 and RTX A5000s with four dense models (Qwen2.5 1.5B, Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B), with and without CUDA graphs, at tensor parallelism 1 and 2. kvplan's KV-cache token count was within 0.7% of vLLM's in 14 of 15 runs and within 1.9% in all of them; before calibration (v0.1) it was within 2.7%. The calibration was fitted to these same runs, so these are in-sample numbers: other GPUs, vLLM versions, MoE and quantised models have not been measured yet. The full table, method and known gaps are in [docs/validation.md](https://github.com/ShawnNotFound/kvplan/blob/master/docs/validation.md).
+Checked against vLLM 0.32.0 on an RTX A6000 and RTX A5000s with four dense models (Qwen2.5 1.5B, Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B), with and without CUDA graphs, at tensor parallelism 1 and 2. kvplan's KV-cache token count was within 0.7% of vLLM's in 14 of 15 runs and within 1.9% in all of them; before calibration (v0.1) it was within 2.7%. The calibration was fitted to these same runs, so these are in-sample numbers: other GPUs, vLLM versions, MoE and quantised models have not been measured yet. In out-of-sample runs on two RTX A6000s at tensor parallelism 2, Llama 3.1 8B was within 0.13%, but the vision-language Qwen2.5-VL 7B was 2.7–3.6% high, because kvplan does not yet model vLLM's encoder profiling. The full table, method and known gaps are in [docs/validation.md](https://github.com/ShawnNotFound/kvplan/blob/master/docs/validation.md).
 
 ## Roadmap
 
