@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (2026-10-30)
 
 - The RoPE cache note is left out when it would read 0.00 GiB (small models). The cache is still counted with the weights.
 - Tied models whose checkpoint still stores `lm_head.weight` (Qwen3 0.6B and 1.7B, Qwen's AWQ and FP8 releases) no longer count it: vLLM does not load it. kvplan's weights for these were up to 0.58 GiB high.
