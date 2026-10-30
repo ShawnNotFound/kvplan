@@ -2,6 +2,26 @@
 
 All references are to vLLM `main` at commit `434eadc` (2026-10-29). Paths are relative to the vLLM repository.
 
+## 0. Which config describes the language model
+
+Sections 0 and 8 and the parts of section 3 marked "(vLLM 0.32)" cite the installed vLLM 0.32.0 package (commit `5df63a720`) and transformers 5.19.0, the versions in [validation.md](validation.md).
+
+vLLM reads the language model's geometry from `get_hf_text_config` (`vllm/transformers_utils/config.py`), which calls transformers' `PretrainedConfig.get_text_config()` (`transformers/configuration_utils.py`). kvplan does the same on the raw config.json:
+
+| Layout | Examples | Where the text config is |
+|---|---|---|
+| flat | Llama, Qwen2.5-VL | config.json itself |
+| `text_config` (or `text_encoder`, `decoder`, `generator`) | Llava, Gemma 3, Qwen3-VL | that sub-config; several of them at once is ambiguous and transformers raises, so kvplan refuses too |
+| `thinker_config.text_config` | Qwen2.5-Omni, Qwen3-Omni, Qwen3-ASR | `Qwen2_5OmniConfig.get_text_config` and `Qwen3OmniMoeConfig.get_text_config` return the thinker's text config |
+| `llm_config` | InternVL, Bagel | vLLM renames it to `text_config` (`_CONFIG_ATTRS_MAPPING`, `_maybe_remap_hf_config_attrs` in `vllm/transformers_utils/config.py`) |
+| `language_config` | DeepSeek-VL2 | vLLM's `DeepseekVLV2Config` loads it as `text_config` (`vllm/transformers_utils/configs/deepseek_vl2.py`) |
+
+A nested text config may leave fields out and rely on its config class's defaults (Llava's `text_config` often names only `model_type: llama`); kvplan fills in `LlamaConfig`'s defaults for `llama`. For other model types a missing field sends kvplan to the weight shapes (below).
+
+**Cross-check with the weights.** After reading the config, kvplan finds the language model's layers in the weight names (ignoring vision, audio and speech-generator prefixes) and compares each layer's K-projection rows with `num_kv_heads × head_dim`, and the layer count with `num_hidden_layers`. If they disagree it stops with an error instead of picking one. Packed quantised weights (GPTQ, AWQ, 4-bit) are skipped, because their shapes are not the logical ones.
+
+**Weight-shape fallback.** When the config has no head or layer counts, kvplan derives the KV width per layer from the language model's K projections. Head counts stay unknown, so tensor-parallel replication cannot be checked; the output says the figures are uncertain. kvplan also warns when config.json names an architecture vLLM 0.32 does not implement natively (`src/kvplan/vllm_architectures.py`, generated from `vllm/model_executor/models/registry.py`); vLLM may then refuse the model or use its Transformers backend.
+
 ## 1. The budget
 
 vLLM measures free memory after creating the CUDA context, NCCL buffers and cuBLAS handles, then reserves
@@ -41,7 +61,9 @@ Read from safetensors headers (exact byte ranges) or GGUF tensor offsets. Per te
 - K and V projections: split over TP ranks, unless there are fewer KV heads than ranks, in which case each rank holds one whole head (`vllm/model_executor/layers/linear.py` `QKVParallelLinear`, `num_kv_head_replicas`).
 - Replicated on every rank: 1-D tensors (norms, biases), MoE routers, MLA's `q_a_proj` and `kv_a_proj_with_mqa`.
 - Everything else (attention and MLP matrices, experts) is split 1/tp.
-- Layers with an index at or above `num_hidden_layers` are multi-token-prediction heads (e.g. DeepSeek-V3 layer 61) and are not loaded.
+- Layers of the language model with an index at or above `num_hidden_layers` are multi-token-prediction heads (e.g. DeepSeek-V3 layer 61) and are not loaded. Encoder layers (a 32-layer audio tower next to a 28-layer text model) are not affected.
+- Parts vLLM does not load (vLLM 0.32): the prefixes a model class maps to `None` in its `hf_to_vllm_mapper`. kvplan lists these per architecture (`NOT_LOADED_PREFIXES` in `src/kvplan/weights.py`): `talker.` and `token2wav.` for Qwen2.5-Omni (`qwen2_5_omni_thinker.py`), `talker.` and `code2wav.` for Qwen3-Omni and Qwen3-ASR (`qwen3_omni_moe_thinker.py`, `qwen3_asr.py`), `tts` for MiniCPM-o (`minicpmo.py`). For other architectures with tensors that look like a speech generator (`talker`, `token2wav`, `code2wav`, `tts`, `vocoder`, ...), kvplan counts them and warns that vLLM may not load them.
+- Encoders built from the plain transformers module rather than vLLM's tensor-parallel layers are held whole on every GPU (vLLM 0.32): the audio tower of Qwen2.5-Omni (`Qwen2_5OmniAudioEncoder`) and of Qwen2-Audio (`Qwen2AudioEncoder`). Vision towers that use vLLM's parallel layers (Qwen2.5-VL) are split.
 
 ## 4. KV bytes per token per layer (per TP rank)
 
@@ -88,6 +110,17 @@ If the config's `layer_types` lists per-layer types, vLLM follows them (`vllm/mo
 - Max concurrency = `num_blocks / Σ_groups blocks per request` and KV tokens = `int(concurrency × L)`, as vLLM logs them (`get_max_concurrency_for_kv_cache_config`, `get_kv_cache_capacity`).
 - Start check: one full-length request needs `bytes_per_block × Σ_groups blocks per request` (this counts padding layers in hybrid models, `_max_memory_usage_bytes_from_groups`), which must fit in `available_kv − bytes_per_block` (one block is held back as the null block). Otherwise vLLM stops and suggests the longest length that fits, found by binary search (`check_enough_kv_cache_memory`, `estimate_max_model_len`). kvplan reports the same number.
 
+## 8. Multimodal encoder profiling (approximate)
+
+Before the text forward pass, `GPUModelRunner.profile_run` (`vllm/v1/worker/gpu_model_runner.py`) runs the multimodal encoder on a batch of dummy items of the largest size and keeps the outputs in the encoder cache while the text pass runs. The profiled peak therefore holds the encoder outputs plus the larger of the encoder's and the text model's activation peaks.
+
+- Encoder budget: `max(max_num_batched_tokens, tokens of the largest item)` (`compute_mm_encoder_budget`, `vllm/v1/core/encoder_cache_manager.py`); the batch holds `budget // item_tokens` items, at most `max_num_seqs × max(1, max_model_len // item_tokens)` (`MultiModalBudget._get_max_items`, `vllm/multimodal/encoder_budget.py`).
+- Largest item: derived only for Qwen2-VL-style processors, as `max_pixels / (patch_size × spatial_merge_size)²` from preprocessor_config.json (`Qwen2VLProcessingInfo.get_image_size_with_most_features`, `vllm/model_executor/models/qwen2_vl.py`); 16,384 tokens for Qwen2.5-VL and Qwen2.5-Omni, as vLLM logged. Otherwise kvplan assumes one item of `max_num_batched_tokens` tokens and says so.
+- Encoder outputs: `tokens × text hidden_size × 2 B`, on every GPU.
+- Encoder activation peak: **approximate**. It is not derived from vLLM; kvplan applies the text model's MLP rule (`2 × positions × intermediate_size × 2 × 2 B / tp`, with `positions = tokens × spatial_merge_size²`) to the encoder config. Measured peaks are both above (Qwen2.5-VL) and below (Qwen2.5-Omni) this, so the output marks the term as approximate. No constant was fitted to the multimodal runs.
+
+`--skip-mm-profiling` and `--limit-mm-per-prompt` change what vLLM profiles; kvplan does not model them.
+
 ## Known gaps
 
 - Overheads in section 2 are estimates.
@@ -95,4 +128,4 @@ If the config's `layer_types` lists per-layer types, vLLM follows them (`vllm/mo
 - MLA block size depends on the attention backend vLLM picks for the GPU; kvplan assumes FlashMLA (64) or CUTLASS MLA (128 on Blackwell). Override with `--block-size`.
 - FP8 MLA checkpoints: vLLM adds a 16-bit copy of `kv_b_proj` (W_UK/W_UV), which kvplan counts.
 - Quantisation kernels that repack or pad weights at load time (e.g. Marlin) can add a little memory that is not modelled.
-- Not modelled at all: Mamba / linear-attention layers, chunked local attention (Llama 4), sparse MLA, MLA-like configs vLLM does not run as MLA (e.g. MiniCPM3), pipeline/expert/data parallelism, LoRA, speculative decoding, multimodal encoder caches.
+- Not modelled at all: Mamba / linear-attention layers, chunked local attention (Llama 4), sparse MLA, MLA-like configs vLLM does not run as MLA (e.g. MiniCPM3), pipeline/expert/data parallelism, LoRA, speculative decoding. The multimodal encoder term (section 8) is approximate.
