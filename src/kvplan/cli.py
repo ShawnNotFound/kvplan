@@ -54,6 +54,11 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--other-gpu-mem-gib", type=float,
                    help="memory already used on the GPU by other processes (default: 0, or what nvidia-smi "
                         "reports with --gpu auto)")
+    c.add_argument("--limit-mm-per-prompt", type=json.loads, default=None, metavar="JSON",
+                   help='as vLLM\'s, e.g. \'{"video": 0}\'; a modality set to 0 is not profiled')
+    c.add_argument("--mm-processor-kwargs", type=json.loads, default=None, metavar="JSON",
+                   help='as vLLM\'s; kvplan reads max_pixels and min_pixels, e.g. \'{"max_pixels": 1003520}\'')
+    c.add_argument("--skip-mm-profiling", action="store_true", help="as vLLM's --skip-mm-profiling")
     c.add_argument("--overhead-gib", type=float,
                    help="replace the estimated activation + CUDA-graph + runtime overhead with this value")
 
@@ -99,6 +104,15 @@ def cmd_inspect(args) -> int:
     for n in loaded.spec.notes + w.notes:
         print(f"  note           {n}")
     return 0
+
+
+def _mm_limits(value) -> dict[str, int]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError('--limit-mm-per-prompt must be a JSON object such as \'{"image": 1, "video": 0}\'')
+    # vLLM also accepts {"image": {"count": 1, ...}}.
+    return {k: int(v["count"] if isinstance(v, dict) else v) for k, v in value.items()}
 
 
 def spec_kind(spec) -> str:
@@ -153,6 +167,10 @@ def cmd_check(args) -> int:
         other_process_bytes=other,
         overhead_bytes=int(args.overhead_gib * GiB) if args.overhead_gib is not None else None,
         gpu_name=gpu_name,
+        mm_limits=_mm_limits(args.limit_mm_per_prompt),
+        mm_max_pixels=(args.mm_processor_kwargs or {}).get("max_pixels"),
+        mm_min_pixels=(args.mm_processor_kwargs or {}).get("min_pixels"),
+        skip_mm_profiling=args.skip_mm_profiling,
     )
     cfg.validate()
     w = weight_bytes_per_rank(loaded.spec, loaded.tensors, cfg.tp)
@@ -181,8 +199,8 @@ def cmd_check(args) -> int:
         print(f"  runtime        {_gib(o.total)} estimated: activation peak {_gib(o.activation_bytes)}, "
               f"torch.compile {_gib(o.compile_bytes)}, CUDA graphs {_gib(o.cudagraph_bytes)}, "
               f"other {_gib(o.non_torch_bytes)}"
-              + (f", {spec_kind(loaded.spec)} encoder profiling {_gib(o.encoder_bytes)} (approximate)"
-                 if o.encoder_bytes else ""))
+              + (f", {spec_kind(loaded.spec)} encoder profiling {_gib(o.encoder_bytes)}"
+                 + (" (approximate)" if o.encoder_approximate else "") if o.encoder_bytes else ""))
     print(f"  KV cache       {_gib(max(p.available_kv_bytes, 0))} available "
           f"({p.kv_bytes_per_token:,} bytes per token per GPU, {p.kv_cache_dtype}, block size {p.block_size})")
     if p.kv is not None:

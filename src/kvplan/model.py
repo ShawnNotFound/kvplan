@@ -17,11 +17,14 @@ _TEXT_CONFIG_NAMES = ("text_encoder", "decoder", "generator", "text_config")
 # Other names vLLM maps onto text_config: llm_config (InternVL, Bagel; _CONFIG_ATTRS_MAPPING in
 # vllm/transformers_utils/config.py) and language_config (DeepSeek-VL2's config class).
 _TEXT_CONFIG_ALIASES = ("llm_config", "language_config")
-# Defaults of the transformers config classes for fields a nested text config may leave out
-# (Llava's text_config often names only model_type llama; transformers fills in LlamaConfig's defaults).
+# Defaults of the transformers config classes (transformers 5.19) for fields a nested text config may
+# leave out; transformers fills them in, so vLLM sees them.
 _CONFIG_DEFAULTS = {
     "llama": {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096, "intermediate_size": 11008,
               "max_position_embeddings": 2048, "vocab_size": 32000},
+    # Qwen2-Audio's text_config names only model_type qwen2 and a few fields.
+    "qwen2": {"num_hidden_layers": 32, "num_attention_heads": 32, "num_key_value_heads": 32, "hidden_size": 4096,
+              "intermediate_size": 22016, "max_position_embeddings": 32768, "vocab_size": 151936},
 }
 # Sub-configs that describe multimodal encoders vLLM runs at startup to profile memory.
 _ENCODER_CONFIG_KEYS = ("vision_config", "audio_config")
@@ -47,10 +50,12 @@ class MissingConfigFields(UnsupportedModel):
 class EncoderSpec:
     """A multimodal encoder (vision or audio tower) that vLLM runs during its startup profiling."""
     kind: str                       # "vision" or "audio"
+    family: str                     # "qwen_vit", "whisper" or "generic"; see mm.py
+    model_type: str                 # model_type of the config holding the encoder (e.g. qwen2_5_vl)
     hidden_size: int | None
     intermediate_size: int | None
-    spatial_merge_size: int = 1     # encoder positions per output token = merge^2
-    max_item_tokens: int | None = None  # output tokens of the largest item, when it can be derived
+    config: dict = field(default_factory=dict)        # the encoder's sub-config
+    preprocessor: dict = field(default_factory=dict)  # preprocessor_config.json
 
 
 @dataclass
@@ -77,6 +82,7 @@ class ModelSpec:
     source: str = "config"
     notes: list[str] = field(default_factory=list)
     intermediate_size: int | None = None   # dense MLP width; None for MoE or when unknown
+    rotary_cache_bytes: int = 0             # RoPE cos/sin caches vLLM keeps on every GPU
     architecture: str | None = None        # config.json "architectures"[0]
     encoder: EncoderSpec | None = None      # multimodal encoder profiled at startup
 
@@ -192,6 +198,40 @@ def _rope_parameter_sets(cfg: dict) -> list[dict]:
     return [rp]
 
 
+def rotary_cache_bytes(cfg: dict, head_dim: int, dtype_bytes: int = 2) -> int:
+    """Bytes of the rotary cos/sin caches vLLM keeps on every GPU.
+
+    get_rope (vllm/model_executor/layers/rotary_embedding/__init__.py) builds one cache per
+    distinct RoPE configuration and shares it across layers. Each holds max_position x rotary_dim
+    values in the model dtype (base.py RotaryEmbedding.__init__). M-RoPE enlarges max_position 4x
+    (mrope.py, positions_factor), linear scaling by its factor (linear_scaling_rope.py), and YaRN
+    builds its cache over original_max_position_embeddings x factor (yarn_scaling_rope.py).
+    """
+    if not any(k in cfg for k in ("rope_theta", "rope_parameters", "rope_scaling")):
+        return 0
+    max_pos = cfg.get("max_position_embeddings")
+    if not isinstance(max_pos, (int, float)) or max_pos <= 0:
+        return 0
+    sets = _rope_parameter_sets(cfg) or [{}]
+    if cfg.get("rope_local_base_freq"):
+        sets = sets + [{}]      # Gemma 3: a second cache for the sliding-window layers
+    total = 0
+    for rp in sets:
+        rtype = rp.get("rope_type") or rp.get("type") or "default"
+        factor = rp.get("factor") or 1
+        positions = int(max_pos)
+        if "mrope_section" in rp:
+            positions *= 4
+        elif rtype == "linear":
+            positions = int(max_pos * factor)
+        elif rtype in ("yarn", "deepseek_yarn"):
+            positions = int(rp.get("original_max_position_embeddings", max_pos) * factor)
+        fraction = rp.get("partial_rotary_factor", cfg.get("partial_rotary_factor", 1.0)) or 1.0
+        rotary_dim = int(rp.get("rope_dim") or head_dim * fraction)
+        total += positions * rotary_dim * dtype_bytes
+    return total
+
+
 def context_lengths(cfg: dict, model_type: str, tokenizer_config: dict | None = None) -> tuple[int | None, int | None]:
     """(maximum vLLM allows, default vLLM uses) for max_model_len, following _get_and_verify_max_len."""
     found = [cfg[k] for k in _LENGTH_KEYS if isinstance(cfg.get(k), (int, float))]
@@ -255,24 +295,28 @@ def kv_cache_dtype_from_quant(quant: dict | None) -> str | None:
 
 
 def encoder_spec(container: dict, preprocessor: dict | None) -> EncoderSpec | None:
-    """The multimodal encoder vLLM profiles at startup, from the config that holds the text config."""
+    """The multimodal encoder vLLM profiles at startup, from the config that holds the text config.
+
+    With both a vision and an audio tower, the vision tower is returned: video items have the most
+    tokens in every model kvplan knows, so vLLM profiles the vision encoder.
+    """
+    model_type = str(container.get("model_type", ""))
+    if model_type.endswith("_thinker"):
+        model_type = model_type[: -len("_thinker")]
     for key in _ENCODER_CONFIG_KEYS:
         enc = container.get(key)
         if not isinstance(enc, dict):
             continue
         hidden = _int_or_none(_first(enc, "hidden_size", "d_model", "embed_dim", "width"))
         inter = _int_or_none(_first(enc, "intermediate_size", "encoder_ffn_dim", "mlp_dim", "ffn_dim"))
-        merge = _int_or_none(enc.get("spatial_merge_size")) or 1
-        patch = _int_or_none(enc.get("patch_size"))
-        max_pixels = None
-        if preprocessor:
-            size = preprocessor.get("size") if isinstance(preprocessor.get("size"), dict) else {}
-            max_pixels = _int_or_none(preprocessor.get("max_pixels")) or _int_or_none(size.get("longest_edge"))
-        # Qwen2-VL-style processors: the largest item has max_pixels / (patch * merge)^2 tokens
-        # (Qwen2VLProcessingInfo.get_image_size_with_most_features in vllm/model_executor/models/qwen2_vl.py).
-        item_tokens = max_pixels // (patch * merge) ** 2 if (max_pixels and patch and merge > 1) else None
-        return EncoderSpec(kind=key.split("_")[0], hidden_size=hidden, intermediate_size=inter,
-                           spatial_merge_size=merge, max_item_tokens=item_tokens)
+        if key == "vision_config" and model_type in ("qwen2_5_vl", "qwen2_5_omni"):
+            family = "qwen_vit"
+        elif key == "audio_config" and enc.get("encoder_ffn_dim"):
+            family = "whisper"
+        else:
+            family = "generic"
+        return EncoderSpec(kind=key.split("_")[0], family=family, model_type=model_type, hidden_size=hidden,
+                           intermediate_size=inter, config=enc, preprocessor=preprocessor or {})
     return None
 
 
@@ -363,6 +407,7 @@ def spec_from_config(top: dict, tokenizer_config: dict | None = None, preprocess
                                                                    "n_inner")),
         architecture=_architecture(top),
         encoder=encoder_spec(container, preprocessor),
+        rotary_cache_bytes=rotary_cache_bytes(cfg, int(qk_rope) if kv_lora_rank is not None else int(head_dim)),
     )
 
 
@@ -522,9 +567,11 @@ def spec_from_tensors(tensors, model_type: str = "unknown", reason: str = "confi
            and re.search(r"(embed_tokens|wte|word_embeddings|tok_embeddings)\.weight$", t.name)]
     vocab, hidden = (emb[0].shape[0], emb[0].shape[1]) if emb and len(emb[0].shape) == 2 else (None, None)
     return ModelSpec(
-        model_type=model_type, num_layers=n, hidden_size=hidden, num_heads=1, num_kv_heads=1,
-        head_dim=kv_width, v_head_dim=kv_width, vocab_size=vocab, max_position_embeddings=None,
+        # Head counts are unknown: model the KV width as kv_width one-channel heads, so that it splits
+        # evenly across tensor-parallel ranks (true whenever num_kv_heads >= tp).
+        model_type=model_type, num_layers=n, hidden_size=hidden, num_heads=kv_width, num_kv_heads=kv_width,
+        head_dim=1, v_head_dim=1, vocab_size=vocab, max_position_embeddings=None,
         layer_types=[FULL] * n, source="tensor shapes", architecture=architecture,
         notes=[f"attention geometry derived from the weight shapes under '{prefix}' because {reason}; "
-               "head counts are unknown, so the KV size assumes no tensor-parallel head replication"],
+               "head counts are unknown, so the KV size assumes the KV heads split evenly across GPUs (no replication)"],
     )

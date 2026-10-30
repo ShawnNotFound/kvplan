@@ -11,6 +11,7 @@ from helpers import llama_like_tensors, write_model_dir
 from kvplan.loader import load
 from kvplan.model import UnsupportedModel, spec_from_config, text_config
 from kvplan.sources import LocalSource
+from kvplan import mm
 from kvplan.vllm import GiB, ServeConfig, encoder_profile_bytes, plan
 from kvplan.weights import weight_bytes_per_rank
 
@@ -31,6 +32,8 @@ def fixture(repo: str, kind: str = "config") -> dict:
     ("Qwen/Qwen3-Omni-30B-A3B-Instruct", "thinker_config.text_config", (48, 32, 4, 128, 2048)),
     ("OpenGVLab/InternVL3-8B", "llm_config", (28, 28, 4, 128, 3584)),
     ("deepseek-ai/deepseek-vl2-tiny", "language_config", (12, 10, 10, 128, 1280)),
+    # text_config names only model_type qwen2: Qwen2Config's defaults apply (32 KV heads, as vLLM uses).
+    ("Qwen/Qwen2-Audio-7B-Instruct", "text_config", (32, 32, 32, 128, 4096)),
 ])
 def test_text_config_resolution_on_real_configs(repo, path, geometry):
     cfg = fixture(repo)
@@ -138,7 +141,12 @@ def test_shape_fallback_uses_the_language_model_and_warns(tmp_path):
                       "vision_tower.")
     m = load(LocalSource(write_model_dir(tmp_path / "m", {"model_type": "mystery"}, lm | vision)))
     assert m.spec.source == "tensor shapes"
-    assert (m.spec.num_layers, m.spec.head_dim) == (3, 16)    # 2 KV heads x head_dim 8
+    assert m.spec.num_layers == 3
+    assert m.spec.num_kv_heads * m.spec.head_dim == 16           # 2 KV heads x head_dim 8
+    # Unknown head counts: the KV width splits across GPUs instead of being copied to each.
+    from kvplan.kv import kv_layout
+    per_gpu = [sum(l.page_bytes for l in kv_layout(m.spec, tp).layers) for tp in (1, 2)]
+    assert per_gpu[1] * 2 == per_gpu[0]
     p = plan(m.spec, weight_bytes_per_rank(m.spec, m.tensors, 1),
              ServeConfig(gpu_total_bytes=24 * GiB, max_model_len=1024))
     assert any(c.message.startswith("UNCERTAIN: the attention geometry was derived from weight shapes")
@@ -147,31 +155,86 @@ def test_shape_fallback_uses_the_language_model_and_warns(tmp_path):
 
 # ---------------------------------------------------------------- encoder profiling
 
-def test_qwen_vl_largest_item_from_preprocessor_config():
-    s = spec_from_config(fixture("Qwen/Qwen2.5-VL-7B-Instruct"), None,
-                         fixture("Qwen/Qwen2.5-VL-7B-Instruct", "preprocessor_config"))
-    # max_pixels 12845056 / (patch 14 x merge 2)^2: the 16,384-token item vLLM 0.32 logged.
-    assert s.encoder.max_item_tokens == 16384 and s.encoder.spatial_merge_size == 2
+def vl_spec(repo="Qwen/Qwen2.5-VL-7B-Instruct"):
+    return spec_from_config(fixture(repo), None, fixture(repo, "preprocessor_config"))
 
 
-def test_encoder_term_follows_vllm_budget_rules():
-    s = spec_from_config(fixture("Qwen/Qwen2.5-VL-7B-Instruct"), None,
-                         fixture("Qwen/Qwen2.5-VL-7B-Instruct", "preprocessor_config"))
-    extra, note = encoder_profile_bytes(s, tp=2, batched_tokens=8192, num_seqs=256, max_model_len=4096,
-                                        text_activation=0)
-    out = 16384 * 3584 * 2                                    # encoder outputs kept in the encoder cache
-    peak = 2 * 16384 * 4 * 3420 * 2 * 2 // 2                  # 2 x gate/up over 65,536 positions, split over 2 GPUs
-    assert extra == out + peak
-    assert note.startswith("APPROXIMATE") and "1 item(s) of 16,384 tokens" in note
-    # Without the preprocessor config the item size is unknown and the budget is assumed.
-    s.encoder.max_item_tokens = None
-    _, note = encoder_profile_bytes(s, 2, 8192, 256, 4096, 0)
-    assert "could not be derived" in note
+# (max_pixels override, limits, max_model_len) -> (modality, items, tokens budgeted, tokens produced,
+# encoder positions per item), as vLLM 0.32 logged them on RTX A6000 / A5000 (docs/validation.md).
+@pytest.mark.parametrize("repo, max_pixels, limits, max_len, expected", [
+    ("Qwen/Qwen2.5-VL-7B-Instruct", None, {}, 4096, ("video", 1, 16384, 16384, 65536)),
+    ("Qwen/Qwen2.5-VL-7B-Instruct", 1003520, {}, 4096, ("video", 2, 3840, 3840, 15360)),
+    ("Qwen/Qwen2.5-VL-7B-Instruct", 3211264, {}, 4096, ("video", 2, 4096, 4096, 16384)),
+    ("Qwen/Qwen2.5-VL-7B-Instruct", 1003520, {}, 8192, ("video", 1, 7680, 7680, 30720)),
+    ("Qwen/Qwen2.5-VL-7B-Instruct", None, {"image": 1, "video": 0}, 4096, ("image", 1, 16384, 16384, 65536)),
+    # The Omni HF processor resizes video to 768 x 28 x 28 pixels per frame pair: 729 tokens, not 16,384.
+    ("Qwen/Qwen2.5-Omni-7B", None, {}, 4096, ("video", 1, 16384, 729, 2916)),
+    ("Qwen/Qwen2.5-Omni-7B", None, {"video": 0}, 4096, ("image", 1, 16384, 16384, 65536)),
+    ("Qwen/Qwen2.5-Omni-7B", 1003520, {}, 4096, ("video", 2, 3840, 3840, 15360)),
+])
+def test_qwen_vl_dummy_items_match_vllm(repo, max_pixels, limits, max_len, expected):
+    s = vl_spec(repo)
+    p = mm.profile(s.encoder, s.hidden_size, 1, 8192, 256, max_len, limits, max_pixels)
+    assert (p.modality, p.items, p.item_tokens, p.item_outputs, p.item_positions) == expected
+    assert not p.approximate
+
+
+def test_qwen_vit_bytes_per_position():
+    # Qwen2.5-VL ViT: h 1280, i 3420. 3h + 3i (+ h at tp > 1) in bf16 plus the uint8 pixels.
+    s = vl_spec()
+    assert mm.bytes_per_position(s.encoder, 1) == (3 * 1280 + 3 * 3420) * 2 + 1176
+    assert mm.bytes_per_position(s.encoder, 2) == (4 * 1280 + 3 * 3420 // 2) * 2 + 1176
+
+
+def test_profiled_peak_is_encoder_or_outputs_plus_text_pass():
+    s = vl_spec()
+    cfg = ServeConfig(gpu_total_bytes=48 * GiB, max_model_len=4096, max_num_batched_tokens=8192, enforce_eager=True)
+    # Large item: the encoder pass sets the peak.
+    extra, note, approx = encoder_profile_bytes(s, cfg, 8192, 256, 4096, text_activation=GiB)
+    assert extra == 65536 * mm.bytes_per_position(s.encoder, 1) - GiB and not approx
+    assert "1 video item(s) of 16,384 tokens" in note
+    # Small items: the text pass with the encoder outputs held sets it.
+    cfg.mm_max_pixels = 1003520
+    extra, _, _ = encoder_profile_bytes(s, cfg, 8192, 256, 4096, text_activation=GiB)
+    assert extra == 2 * 3840 * 3584 * 2
+    cfg.skip_mm_profiling = True
+    assert encoder_profile_bytes(s, cfg, 8192, 256, 4096, GiB) == (0, "", False)
+
+
+def test_whisper_audio_items():
+    s = spec_from_config(fixture("Qwen/Qwen2-Audio-7B-Instruct"))
+    assert s.encoder.family == "whisper"
+    p = mm.profile(s.encoder, s.hidden_size, 1, 8192, 256, 4096)
+    # vLLM 0.32 logged 10 audio items of 750 tokens (budget 8192).
+    assert (p.modality, p.items, p.item_outputs, p.item_positions) == ("audio", 10, 750, 1500)
+    assert p.approximate
+
+
+def test_rotary_cache_counted_with_the_weights():
+    s = vl_spec()
+    # M-RoPE: 4 x 128,000 positions x 128 dims in bf16, as vLLM 0.32 allocated (0.122 GiB).
+    assert s.rotary_cache_bytes == 512_000 * 128 * 2
+    w = weight_bytes_per_rank(s, [], 1)
+    assert w.per_rank_bytes == w.buffer_bytes == s.rotary_cache_bytes
+
+
+def test_generic_encoders_are_flagged_uncertain():
+    s = spec_from_config(fixture("unsloth/gemma-3-4b-it"))
+    p = plan(s, weight_bytes_per_rank(s, [], 1), ServeConfig(gpu_total_bytes=24 * GiB, max_model_len=4096))
+    assert any(c.message.startswith("UNCERTAIN: kvplan cannot size vLLM's startup profiling") for c in p.checks)
+
+
+def test_unknown_encoders_are_approximate():
+    s = spec_from_config(fixture("unsloth/gemma-3-4b-it"))
+    cfg = ServeConfig(gpu_total_bytes=24 * GiB, max_model_len=4096)
+    extra, note, approx = encoder_profile_bytes(s, cfg, 2048, 256, 4096, text_activation=0)
+    assert approx and note.startswith("APPROXIMATE") and "could not be derived" in note and extra > 0
 
 
 def test_text_only_models_get_no_encoder_term():
     s = spec_from_config(SMALL)
-    assert encoder_profile_bytes(s, 1, 8192, 256, 2048, 0) == (0, "")
+    cfg = ServeConfig(gpu_total_bytes=24 * GiB)
+    assert encoder_profile_bytes(s, cfg, 8192, 256, 2048, 0) == (0, "", False)
 
 
 def test_encoder_term_is_part_of_the_plan():

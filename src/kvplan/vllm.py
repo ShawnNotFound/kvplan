@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass, field
 
+from . import mm
 from .kv import KVCapacity, kv_capacity, kv_layout, resolve_kv_cache_dtype
 from .model import ModelSpec
 from .vllm_architectures import VLLM_ARCHITECTURES
@@ -41,6 +42,10 @@ NCCL_BYTES_PER_EXTRA_RANK = int(0.25 * GiB)
 CUDAGRAPH_BYTES = int(0.25 * GiB)
 COMPILE_ACTIVATION_FACTOR = 7
 NON_TORCH_BYTES = int(0.25 * GiB)       # measured 0.16-0.39 GiB beyond the weight files
+# Multimodal models leave more non-torch memory after profiling: 0.39-0.57 GiB (median 0.45) on the
+# A6000 TP=1 fit runs in docs/validation.md. The cause was not traced to a vLLM allocation, so this
+# is a fitted constant, applied to every model with a vision or audio encoder.
+MM_NON_TORCH_EXTRA_BYTES = int(0.20 * GiB)
 MLP_PEAK_FACTOR = 2                     # eager peak = 2 x the gate/up projection output
 
 
@@ -59,6 +64,10 @@ class ServeConfig:
     other_process_bytes: int = 0
     overhead_bytes: int | None = None   # replaces the activation/graph/non-torch estimate
     gpu_name: str = ""
+    mm_limits: dict[str, int] = field(default_factory=dict)   # --limit-mm-per-prompt
+    mm_max_pixels: int | None = None    # --mm-processor-kwargs max_pixels
+    mm_min_pixels: int | None = None
+    skip_mm_profiling: bool = False
 
     def validate(self) -> None:
         if self.gpu_total_bytes <= 0:
@@ -106,8 +115,9 @@ class Overheads:
     non_torch_bytes: int
     user_override: bool = False
     calibrated: bool = True   # False when the model falls outside what was measured (MoE, unknown MLP)
-    encoder_bytes: int = 0    # approximate extra peak from profiling the multimodal encoder
+    encoder_bytes: int = 0    # extra peak from profiling the multimodal encoder (mm.py)
     encoder_note: str = ""
+    encoder_approximate: bool = False
 
     @property
     def total(self) -> int:
@@ -115,43 +125,32 @@ class Overheads:
                 + self.encoder_bytes)
 
 
-def encoder_profile_bytes(spec: ModelSpec, tp: int, batched_tokens: int, num_seqs: int, max_model_len: int,
-                          text_activation: int) -> tuple[int, str]:
-    """Approximate extra peak from vLLM's multimodal encoder profiling, and a note saying how it was derived.
+def encoder_profile_bytes(spec: ModelSpec, cfg: ServeConfig, batched_tokens: int, num_seqs: int,
+                          max_model_len: int, text_activation: int) -> tuple[int, str, bool]:
+    """Extra profiled peak from vLLM's multimodal startup profiling (mm.py), a note saying how it was
+    derived, and whether it is approximate.
 
-    GPUModelRunner.profile_run (vllm/v1/worker/gpu_model_runner.py) first runs the encoder on a
-    batch of dummy items of the largest size, keeps the outputs in the encoder cache, then runs the
-    text forward pass. The encoder budget is max(max_num_batched_tokens, tokens of the largest item)
-    (compute_mm_encoder_budget in vllm/v1/core/encoder_cache_manager.py), and the batch holds
-    budget // item_tokens items (MultiModalBudget._get_max_items in vllm/multimodal/encoder_budget.py).
-
-    The encoder's own activation peak is not measured: it is approximated with the same rule as the
-    text model's MLP peak (2 x the gate/up output over every encoder position), so the result is
-    labelled approximate.
+    The encoder pass runs first and its outputs stay in the encoder cache during the text pass, so
+    the profiled peak is max(encoder peak, encoder outputs + text peak).
     """
     enc = spec.encoder
-    if enc is None:
-        return 0, ""
-    dtype = spec.model_dtype_bytes
-    item = enc.max_item_tokens
-    budget = max(batched_tokens, item or 0)
-    if item:
-        per_prompt = max(1, max_model_len // item)
-        items = max(1, min(budget // item, num_seqs * per_prompt))
-        out_tokens = items * item
-        how = f"{items} item(s) of {item:,} tokens"
-    else:
-        out_tokens = budget
-        how = f"an assumed {budget:,}-token item (the largest item size could not be derived)"
-    out_bytes = out_tokens * (spec.hidden_size or 0) * dtype
-    positions = out_tokens * enc.spatial_merge_size ** 2
-    inter = enc.intermediate_size or (4 * enc.hidden_size if enc.hidden_size else 0)
-    enc_peak = positions * inter * 2 * dtype * MLP_PEAK_FACTOR // tp
-    extra = max(enc_peak - text_activation, 0) + out_bytes
-    note = (f"APPROXIMATE: includes {extra / GiB:.2f} GiB for vLLM's startup profiling of the {enc.kind} encoder "
-            f"({how}); kvplan has not been calibrated on encoder memory, so the KV figure may be off by a few "
-            "percent. vLLM's --skip-mm-profiling or --limit-mm-per-prompt change this")
-    return extra, note
+    if enc is None or cfg.skip_mm_profiling:
+        return 0, "", False
+    prof = mm.profile(enc, spec.hidden_size or 0, cfg.tp, batched_tokens, num_seqs, max_model_len,
+                      cfg.mm_limits, cfg.mm_max_pixels, cfg.mm_min_pixels)
+    if prof is None:
+        return 0, "", False
+    peak = max(prof.encoder_peak_bytes, prof.output_bytes + text_activation)
+    extra = peak - text_activation
+    what = (f"{prof.items} {prof.modality} item(s) of {prof.item_outputs:,} tokens"
+            + (f" (budgeted as {prof.item_tokens:,})" if prof.item_outputs != prof.item_tokens else ""))
+    note = (f"includes {extra / GiB:.2f} GiB for vLLM's startup profiling of the {enc.kind} encoder on {what}"
+            + ("; " + "; ".join(prof.notes) if prof.notes else "")
+            + ". --limit-mm-per-prompt, --mm-processor-kwargs and --skip-mm-profiling change this")
+    if prof.approximate:
+        note = ("APPROXIMATE: " + note + f". kvplan's encoder memory rule for this model ({enc.family}) is "
+                "approximate (docs/accounting.md, section 8), so the KV figure may be off by a few percent")
+    return extra, note, prof.approximate
 
 
 def estimate_overheads(spec: ModelSpec, cfg: ServeConfig, batched_tokens: int, num_seqs: int,
@@ -174,9 +173,10 @@ def estimate_overheads(spec: ModelSpec, cfg: ServeConfig, batched_tokens: int, n
         activation, calibrated = batched_tokens * hidden * dtype * 12 // cfg.tp + 2 * logits, False
     compiled = 0 if cfg.enforce_eager else batched_tokens * hidden * dtype * COMPILE_ACTIVATION_FACTOR // cfg.tp
     graphs = 0 if cfg.enforce_eager else CUDAGRAPH_BYTES
-    encoder, note = encoder_profile_bytes(spec, cfg.tp, batched_tokens, num_seqs, max_model_len, activation)
-    return Overheads(activation, compiled, graphs, NON_TORCH_BYTES, calibrated=calibrated,
-                     encoder_bytes=encoder, encoder_note=note)
+    encoder, note, approx = encoder_profile_bytes(spec, cfg, batched_tokens, num_seqs, max_model_len, activation)
+    non_torch = NON_TORCH_BYTES + (MM_NON_TORCH_EXTRA_BYTES if spec.encoder is not None else 0)
+    return Overheads(activation, compiled, graphs, non_torch, calibrated=calibrated,
+                     encoder_bytes=encoder, encoder_note=note, encoder_approximate=approx)
 
 
 @dataclass
@@ -236,6 +236,13 @@ def plan(spec: ModelSpec, weights: WeightBreakdown, cfg: ServeConfig, model_name
         checks.append(Check(True, "warning", f"UNCERTAIN: vLLM 0.32 has no native implementation of "
                                              f"{spec.architecture}; it may refuse the model or run it through "
                                              "the Transformers backend, whose memory use kvplan has not measured"))
+    if spec.encoder is not None and spec.encoder.family == "generic" and not cfg.skip_mm_profiling \
+            and cfg.overhead_bytes is None:
+        checks.append(Check(True, "warning", f"UNCERTAIN: kvplan cannot size vLLM's startup profiling of this "
+                                             f"model's {spec.encoder.kind} encoder; in measurements it ranged from "
+                                             "0.1 to 5.9 GiB (MiniCPM-o 2.6), so the KV figure and the start "
+                                             "check may be wrong. Pass --overhead-gib, or --skip-mm-profiling if "
+                                             "you run vLLM with it"))
     if spec.num_kv_heads < tp and not spec.is_mla and spec.source != "tensor shapes":
         checks.append(Check(True, "info", f"only {spec.num_kv_heads} KV heads for {tp} GPUs: each GPU keeps a "
                                           "replicated head, so KV memory does not shrink further with more GPUs"))

@@ -67,6 +67,7 @@ class WeightBreakdown:
     skipped_bytes: int
     tied: bool
     notes: list[str]
+    buffer_bytes: int = 0     # non-weight buffers vLLM allocates at load time (RoPE caches)
 
 
 def _resident_bytes(t: Tensor, dtype_bytes: int) -> int:
@@ -155,12 +156,17 @@ def weight_bytes_per_rank(spec: ModelSpec, tensors: list[Tensor], tp: int = 1) -
     if mtp:
         notes.append(f"skipped {mtp / 2**30:.2f} GiB of multi-token-prediction layers, which vLLM loads only "
                      "for speculative decoding")
+    buffers = spec.rotary_cache_bytes
+    if buffers:
+        notes.append(f"includes {buffers / 2**30:.2f} GiB of RoPE cos/sin cache that vLLM allocates when it loads "
+                     "the model")
     return WeightBreakdown(
-        per_rank_bytes=int(round(per_rank)),
+        per_rank_bytes=int(round(per_rank)) + buffers,
         total_checkpoint_bytes=sum(t.nbytes for t in tensors),
         embedding_bytes=embedding,
         replicated_bytes=replicated,
         skipped_bytes=skipped,
         tied=tied,
         notes=sorted(set(notes)),
+        buffer_bytes=buffers,
     )
