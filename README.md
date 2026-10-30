@@ -22,19 +22,21 @@ unsloth/Meta-Llama-3.1-8B-Instruct on 1 x L4 (max_model_len 131072, max_num_seqs
   try            --tensor-parallel-size 2 on 2 GPUs splits weights and KV further
 ```
 
-> **Status: alpha.** Weight and KV sizes are computed exactly from the model files. The runtime overheads (activation peak, torch.compile buffers, CUDA graphs) are fitted to vLLM 0.32 startup logs from 15 runs on RTX A6000 and A5000 GPUs; see [Accuracy](#accuracy) for what that does and does not cover.
+> **Status: alpha.** Weight and KV sizes are computed exactly from the model files. The runtime overheads (activation peak, torch.compile buffers, CUDA graphs) are fitted to vLLM 0.32 startup logs from 15 runs on RTX A6000 and A5000 GPUs; see [Accuracy](https://github.com/ShawnNotFound/kvplan#accuracy) for what that does and does not cover.
 
 ## Why
 
 vLLM decides its KV cache size at startup, on the real GPU: it reserves `gpu_memory_utilization` of the **total** GPU memory, loads the weights, profiles a forward pass, and gives whatever is left to the KV cache. If one request at `max_model_len` doesn't fit, it refuses to start. You find this out after renting or buying the GPU.
 
-Other tools approximate this with parameter count × bytes per parameter plus a fixed overhead. That misses quantisation scales, padded vocabularies, tied embeddings, sliding-window layers, latent (MLA) caches and how tensor parallelism splits or replicates KV heads. kvplan reproduces vLLM's own accounting instead. See [docs/accounting.md](docs/accounting.md) for every rule and the vLLM source it comes from.
+Other tools approximate this with parameter count × bytes per parameter plus a fixed overhead. That misses quantisation scales, padded vocabularies, tied embeddings, sliding-window layers, latent (MLA) caches and how tensor parallelism splits or replicates KV heads. kvplan reproduces vLLM's own accounting instead. See [docs/accounting.md](https://github.com/ShawnNotFound/kvplan/blob/master/docs/accounting.md) for every rule and the vLLM source it comes from.
 
 ## Install
 
 ```
-pip install git+https://github.com/ShawnNotFound/kvplan
+pip install kvplan
 ```
+
+or the latest development version: `pip install git+https://github.com/ShawnNotFound/kvplan`.
 
 No dependencies beyond Python 3.10+. For gated models (Llama, Gemma), set `HF_TOKEN` or run `huggingface-cli login`.
 
@@ -83,17 +85,17 @@ openai/gpt-oss-20b
 | Weights | exact bytes per tensor, 16-bit loading of fp32 checkpoints, quantised formats at their stored size, vocab padding, tied embeddings, MTP layers excluded, tensor-parallel sharding and KV-head replication |
 | vLLM | utilisation budget, free-memory check, KV block grouping and rounding, max concurrency, the max_model_len check and its suggested length |
 
-In a sample of the 300 most-downloaded text-generation models on Hugging Face, kvplan's sources describe 93% without a token and 98% with one (details in [docs/coverage.md](docs/coverage.md)).
+In a sample of the 300 most-downloaded text-generation models on Hugging Face, kvplan's sources describe 93% without a token and 98% with one (details in [docs/coverage.md](https://github.com/ShawnNotFound/kvplan/blob/master/docs/coverage.md)).
 
 **Not yet supported:** models with Mamba or linear-attention layers (Qwen3-Next, Jamba, Nemotron-H, Falcon-H1), DeepSeek V3.2 sparse attention, encoder-decoder models, pipeline/expert/data parallelism, LoRA, speculative decoding, and llama.cpp. kvplan says so instead of guessing.
 
 ## Accuracy
 
-Checked against vLLM 0.32.0 on an RTX A6000 and RTX A5000s with four dense models (Qwen2.5 1.5B, Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B), with and without CUDA graphs, at tensor parallelism 1 and 2. kvplan's KV-cache token count was within 0.7% of vLLM's in 14 of 15 runs and within 1.9% in all of them; before calibration (v0.1) it was within 2.7%. The calibration was fitted to these same runs, so these are in-sample numbers: other GPUs, vLLM versions, MoE and quantised models have not been measured yet. The full table, method and known gaps are in [docs/validation.md](docs/validation.md).
+Checked against vLLM 0.32.0 on an RTX A6000 and RTX A5000s with four dense models (Qwen2.5 1.5B, Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B), with and without CUDA graphs, at tensor parallelism 1 and 2. kvplan's KV-cache token count was within 0.7% of vLLM's in 14 of 15 runs and within 1.9% in all of them; before calibration (v0.1) it was within 2.7%. The calibration was fitted to these same runs, so these are in-sample numbers: other GPUs, vLLM versions, MoE and quantised models have not been measured yet. The full table, method and known gaps are in [docs/validation.md](https://github.com/ShawnNotFound/kvplan/blob/master/docs/validation.md).
 
 ## Roadmap
 
-- v0.2: calibrated runtime overheads (done for dense models, see Accuracy), a measurement script anyone can run on their GPU, PyPI release
+- v0.2: calibrated runtime overheads (done for dense models, see Accuracy), a measurement script anyone can run on their GPU
 - v0.3: llama.cpp profile, published validation table
 - v0.4: `place`: several models across several machines with mixed GPUs
 

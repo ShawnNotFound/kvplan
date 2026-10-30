@@ -4,10 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kvplan"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Plan vLLM deployments without the GPU: will it start, how much KV cache, how many users."
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Shawn (Shuaijie Shao)" }]
 keywords = ["vllm", "llm", "gpu", "memory", "kv-cache", "inference"]
@@ -16,7 +17,14 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = []
@@ -28,7 +36,13 @@ test = ["pytest>=8"]
 kvplan = "kvplan.cli:main"
 
 [project.urls]
+Homepage = "https://github.com/ShawnNotFound/kvplan"
 Repository = "https://github.com/ShawnNotFound/kvplan"
+Issues = "https://github.com/ShawnNotFound/kvplan/issues"
+Changelog = "https://github.com/ShawnNotFound/kvplan/blob/master/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/kvplan/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kvplan"]
