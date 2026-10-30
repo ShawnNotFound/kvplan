@@ -47,7 +47,7 @@ kvplan check MODEL (--gpu NAME | --gpu-mem-gib GIB) [vLLM options]
 kvplan inspect MODEL
 ```
 
-`MODEL` is a Hugging Face repo id or a local directory or file. `check` understands the vLLM options that change memory: `-tp/--tensor-parallel-size`, `--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--block-size`, `--enforce-eager`. Add `--json` for scripts and CI; the exit code is 0 when vLLM should start and 1 when it won't.
+`MODEL` is a Hugging Face repo id or a local directory or file. `check` understands the vLLM options that change memory: `-tp/--tensor-parallel-size`, `--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--block-size`, `--enforce-eager`. Add `--json` for scripts and CI. The exit code is 0 when vLLM should start and 1 when it won't. It is 3 ("start not confirmed", `"starts": null` in the JSON) when a term kvplan cannot size could decide the outcome: an encoder whose startup profiling it cannot size, an architecture vLLM has no native implementation of, or attention geometry read from weight shapes. The output then names the unsized term, the memory left under kvplan's estimates, and what to do. Exit code 2 is a kvplan error.
 
 For the most precise result, give the GPU memory exactly as CUDA reports it (`--gpu-mem-gib`); the `--gpu` presets use the slightly larger `nvidia-smi` totals.
 

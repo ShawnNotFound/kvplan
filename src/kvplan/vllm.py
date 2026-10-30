@@ -179,6 +179,12 @@ def estimate_overheads(spec: ModelSpec, cfg: ServeConfig, batched_tokens: int, n
                      encoder_bytes=encoder, encoder_note=note, encoder_approximate=approx)
 
 
+VERDICT_STARTS = "vLLM should start"
+VERDICT_FAILS = "vLLM will not start"
+VERDICT_UNCONFIRMED = "start not confirmed"
+LARGEST_MEASURED_ENCODER_PEAK = int(5.95 * GiB)   # MiniCPM-o 2.6, docs/validation.md
+
+
 @dataclass
 class Check:
     ok: bool
@@ -202,9 +208,12 @@ class Plan:
     kv_cache_dtype: str
     block_size: int
     kv: KVCapacity | None
-    starts: bool
+    starts: bool | None       # None: no error found, but an unsized term means the start is not confirmed
     checks: list[Check] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
+    verdict: str = VERDICT_STARTS
+    unconfirmed: list[str] = field(default_factory=list)   # the terms kvplan could not size
+    start_margin_bytes: int | None = None   # memory to spare at the start check under kvplan's estimates
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -229,20 +238,33 @@ def plan(spec: ModelSpec, weights: WeightBreakdown, cfg: ServeConfig, model_name
         if not spec.is_mla and spec.num_kv_heads % tp and tp % spec.num_kv_heads:
             checks.append(Check(False, "error", f"{spec.num_kv_heads} KV heads cannot be split or replicated "
                                                 f"evenly over {tp} GPUs"))
+    unconfirmed: list[str] = []
+    measure_once = ("measure once: start vLLM, then pass its logged peak activation plus consumed memory minus "
+                    "weights as --overhead-gib")
     if spec.source == "tensor shapes":
+        unconfirmed.append("the attention geometry (derived from weight shapes)")
         checks.append(Check(True, "warning", "UNCERTAIN: the attention geometry was derived from weight shapes, "
                                              "not from config.json, so the KV figures may be wrong"))
+        suggestions.append("add the missing attention fields to config.json, or " + measure_once)
     if spec.architecture and spec.architecture not in VLLM_ARCHITECTURES:
+        unconfirmed.append(f"the {spec.architecture} architecture (no native vLLM implementation)")
         checks.append(Check(True, "warning", f"UNCERTAIN: vLLM 0.32 has no native implementation of "
                                              f"{spec.architecture}; it may refuse the model or run it through "
                                              "the Transformers backend, whose memory use kvplan has not measured"))
-    if spec.encoder is not None and spec.encoder.family == "generic" and not cfg.skip_mm_profiling \
-            and cfg.overhead_bytes is None:
+        suggestions.append(measure_once)
+    encoder_unsized = (spec.encoder is not None and spec.encoder.family == "generic" and not cfg.skip_mm_profiling
+                       and cfg.overhead_bytes is None)
+    if encoder_unsized:
+        unconfirmed.append(f"the {spec.encoder.kind} encoder's startup profiling")
         checks.append(Check(True, "warning", f"UNCERTAIN: kvplan cannot size vLLM's startup profiling of this "
                                              f"model's {spec.encoder.kind} encoder; in measurements it ranged from "
                                              "0.1 to 5.9 GiB (MiniCPM-o 2.6), so the KV figure and the start "
-                                             "check may be wrong. Pass --overhead-gib, or --skip-mm-profiling if "
-                                             "you run vLLM with it"))
+                                             "check may be wrong"))
+        suggestions += ["--skip-mm-profiling, if you run vLLM with it: no encoder memory is reserved at startup, "
+                        "so large inputs can run out of memory later",
+                        "--limit-mm-per-prompt (e.g. '{\"video\": 0}') or --mm-processor-kwargs "
+                        "'{\"max_pixels\": ...}' shrink what vLLM profiles",
+                        measure_once]
     if spec.num_kv_heads < tp and not spec.is_mla and spec.source != "tensor shapes":
         checks.append(Check(True, "info", f"only {spec.num_kv_heads} KV heads for {tp} GPUs: each GPU keeps a "
                                           "replicated head, so KV memory does not shrink further with more GPUs"))
@@ -307,13 +329,31 @@ def plan(spec: ModelSpec, weights: WeightBreakdown, cfg: ServeConfig, model_name
             if cap.max_model_len_that_fits > 0:
                 suggestions.append(f"--max-model-len {cap.max_model_len_that_fits} (or lower)")
 
-    starts = not any(not c.ok and c.severity == "error" for c in checks)
+    no_errors = not any(not c.ok and c.severity == "error" for c in checks)
+    margin = None
+    if cap is not None:
+        # The start check needs one full-length request plus vLLM's null block.
+        margin = available - layout.bytes_per_block - cap.bytes_needed_one_request
+    if not no_errors:
+        verdict, starts = VERDICT_FAILS, False
+    elif unconfirmed:
+        verdict, starts = VERDICT_UNCONFIRMED, None
+    else:
+        verdict, starts = VERDICT_STARTS, True
+    if margin is not None and encoder_unsized:
+        assumed = over.activation_bytes + over.encoder_bytes
+        if assumed + margin < LARGEST_MEASURED_ENCODER_PEAK:
+            checks.append(Check(True, "warning",
+                                f"vLLM starts only if its startup profiling peak (encoder pass or text pass) stays "
+                                f"below {_gib(assumed + margin)}; kvplan assumed {_gib(assumed)}, and the largest "
+                                f"measured with an encoder kvplan cannot size was "
+                                f"{_gib(LARGEST_MEASURED_ENCODER_PEAK)} (MiniCPM-o 2.6)"))
     if memory_short:
         if resolve_kv_cache_dtype(spec, cfg.kv_cache_dtype) == "auto" and weights.per_rank_bytes < requested:
             suggestions.append("--kv-cache-dtype fp8 halves the KV cache")
         if spec.source == "tensor shapes" or spec.num_heads % (tp * 2) == 0:
             suggestions.append(f"--tensor-parallel-size {tp * 2} on {tp * 2} GPUs splits weights and KV further")
-    elif starts and cap is not None and cap.max_concurrency < 1.5:
+    elif no_errors and cap is not None and cap.max_concurrency < 1.5:
         suggestions.append("fewer than 2 full-length requests fit at once; consider a lower --max-model-len "
                            "or --kv-cache-dtype fp8 for more concurrency")
 
@@ -322,5 +362,6 @@ def plan(spec: ModelSpec, weights: WeightBreakdown, cfg: ServeConfig, model_name
         overheads=over, available_kv_bytes=available, max_model_len=max_model_len, max_num_seqs=seqs,
         max_num_batched_tokens=batched, kv_bytes_per_token=per_token,
         kv_cache_dtype=resolve_kv_cache_dtype(spec, cfg.kv_cache_dtype), block_size=block_size, kv=cap, starts=starts, checks=checks,
-        suggestions=list(dict.fromkeys(suggestions)),
+        suggestions=list(dict.fromkeys(suggestions)), verdict=verdict, unconfirmed=unconfirmed,
+        start_margin_bytes=margin,
     )

@@ -13,7 +13,7 @@ from .kv import kv_layout, resolve_kv_cache_dtype
 from .loader import load
 from .model import UnsupportedModel
 from .sources import SourceError, open_source
-from .vllm import DEFAULT_UTILIZATION, GiB, ServeConfig, plan
+from .vllm import DEFAULT_UTILIZATION, LARGEST_MEASURED_ENCODER_PEAK, GiB, ServeConfig, plan
 from .weights import weight_bytes_per_rank
 
 
@@ -180,7 +180,7 @@ def cmd_check(args) -> int:
         if detected:
             extra["detected_gpus"] = [g.__dict__ | {"cuda_total_mib": g.cuda_total_mib} for g in detected]
         print(json.dumps(p.to_dict() | extra, indent=2))
-        return 0 if p.starts else 1
+        return _exit_code(p)
 
     print(f"{args.model} on {cfg.tp} x {gpu_desc} "
           f"(max_model_len {p.max_model_len}, max_num_seqs {p.max_num_seqs}, "
@@ -207,7 +207,15 @@ def cmd_check(args) -> int:
         print(f"  capacity       {p.kv.kv_tokens:,} tokens; max concurrency at {p.max_model_len:,} tokens per "
               f"request: {p.kv.max_concurrency:.2f}x")
     print()
-    print("  RESULT         " + ("vLLM should start" if p.starts else "vLLM will not start"))
+    result = p.verdict
+    if p.starts is None:
+        result += ": kvplan could not size " + "; ".join(p.unconfirmed)
+        if p.start_margin_bytes is not None:
+            result += f". Under kvplan's estimates {_gib(max(p.start_margin_bytes, 0))} would be left at the start check"
+            if any("encoder" in u for u in p.unconfirmed):
+                result += (f"; the largest encoder startup peak measured so far was "
+                           f"{_gib(LARGEST_MEASURED_ENCODER_PEAK)}")
+    print("  RESULT         " + result)
     for c in p.checks:
         tag = {"error": "error", "warning": "warning", "info": "note"}[c.severity]
         print(f"  {tag:<14} {c.message}")
@@ -220,7 +228,12 @@ def cmd_check(args) -> int:
     if not o.user_override and not o.calibrated:
         print("  note           runtime overheads for this model are a rough estimate: they were calibrated on "
               "dense models only; pass --overhead-gib to override")
-    return 0 if p.starts else 1
+    return _exit_code(p)
+
+
+def _exit_code(p) -> int:
+    """0: vLLM should start; 1: it will not; 3: start not confirmed (2 is a kvplan error)."""
+    return {True: 0, False: 1, None: 3}[p.starts]
 
 
 def main(argv: list[str] | None = None) -> int:

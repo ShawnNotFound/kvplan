@@ -138,12 +138,14 @@ Within 0.72% in all 16 runs (mean absolute error 0.27%).
 
 - **Qwen family and Qwen2-Audio on held-out GPUs and TP:** within 2.24% in all 11 runs (mean absolute error 1.03%). The A5000 rows have small KV pools (3–11 GiB), so a 0.05 GiB error is 1–2% there.
 - **Qwen2-Audio at TP 2:** kvplan's audio-encoder rule is 25% low, and at TP 2 the encoder sets the peak; +1.39%.
-- **MiniCPM-o 2.6 is not modelled:** vLLM profiles 8 videos (or 12 images) and the encoder pass peaks at 5.8–5.9 GiB; kvplan's generic estimate is 1.2 GiB, so it is 19–23% high on the A6000 and says the model starts on an A5000 where vLLM runs out of memory. kvplan now prints an UNCERTAIN warning for every encoder it cannot size, naming this range. With the image-only limit vLLM also skips loading MiniCPM-o's audio tower (0.6 GiB less weight); kvplan does not model that.
+- **MiniCPM-o 2.6 is not modelled:** vLLM profiles 8 videos (or 12 images) and the encoder pass peaks at 5.8–5.9 GiB; kvplan's generic estimate is 1.2 GiB, so it is 19–23% high on the A6000 and says the model starts on an A5000 where vLLM runs out of memory. kvplan now gives the verdict "start not confirmed" (exit code 3) for every encoder it cannot size. For this run it says vLLM starts only if the profiling peak stays below 4.83 GiB; vLLM measured 5.94 GiB. With the image-only limit vLLM also skips loading MiniCPM-o's audio tower (0.6 GiB less weight); kvplan does not model that.
 - **Bug found by the holdout:** Qwen2-Audio's `text_config` names only `model_type: qwen2`, so kvplan fell back to weight shapes and, at TP 2, kept the whole KV width on each GPU (-49.7%). kvplan now fills in transformers' `Qwen2Config` defaults (32 KV heads) and, when it does fall back to weight shapes, splits the KV width across GPUs. The table shows the fixed result.
 
 ### Effect on other models
 
 Checked on the 204 ungated models of the top-300 Hugging Face text-generation list, 2 × H100-80GB, TP 2, from local copies of their configs and safetensors headers. No KV size per token or start/no-start result changed. The RoPE cache adds a median of 0.01 GiB per GPU (most 0.03 GiB or less, at most 0.375 GiB for a 1M-context model with two caches). Three multimodal models also get the encoder terms: Qwen2.5-VL-7B NVFP4 (-0.70 GiB of KV), and Qwen3-VL-30B-A3B AWQ and Kimi-K2.5 NVFP4 (-0.42 and -0.23 GiB, both flagged UNCERTAIN). 64 models fail as before (unsupported architectures).
+
+With the "start not confirmed" verdict, 3 of the 140 models that kvplan sizes move from "should start" to "start not confirmed": Qwen3-VL-30B-A3B AWQ (vision encoder not sized), and GPT-Neo 125M and MiniCPM-SALA AWQ (no native vLLM implementation). The other 123 "should start" and 14 "will not start" verdicts are unchanged.
 
 ### Earlier runs with the current kvplan
 

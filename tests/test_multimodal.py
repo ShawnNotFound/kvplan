@@ -151,6 +151,7 @@ def test_shape_fallback_uses_the_language_model_and_warns(tmp_path):
              ServeConfig(gpu_total_bytes=24 * GiB, max_model_len=1024))
     assert any(c.message.startswith("UNCERTAIN: the attention geometry was derived from weight shapes")
                for c in p.checks)
+    assert p.starts is None and p.unconfirmed == ["the attention geometry (derived from weight shapes)"]
 
 
 # ---------------------------------------------------------------- encoder profiling
@@ -253,3 +254,47 @@ def _numel(shape):
     for d in shape:
         n *= d
     return n
+
+
+# ---------------------------------------------------------------- verdicts with unsized terms
+
+def minicpmo_on_a5000(max_model_len=4096, **kw):
+    s = spec_from_config(fixture("openbmb/MiniCPM-o-2_6"))
+    # 15.70 GiB of weights per GPU, as kvplan reads the checkpoint (docs/validation.md).
+    w = weight_bytes_per_rank(s, [], 1)
+    w.per_rank_bytes += int(15.698 * GiB)
+    cfg = ServeConfig(gpu_total_bytes=int(23.55 * GiB), max_model_len=max_model_len, max_num_batched_tokens=8192,
+                      enforce_eager=True, gpu_memory_utilization=0.9, **kw)
+    return plan(s, w, cfg)
+
+
+def test_minicpmo_on_a5000_is_not_reported_as_starting():
+    # vLLM 0.32 runs out of memory here: the encoder pass peaks at 5.9 GiB.
+    p = minicpmo_on_a5000()
+    assert p.starts is None and p.verdict == "start not confirmed"
+    assert p.unconfirmed == ["the vision encoder's startup profiling"]
+    assert any("stays below" in c.message and "5.95 GiB" in c.message for c in p.checks)
+    assert any(s.startswith("--skip-mm-profiling") for s in p.suggestions)
+    assert p.to_dict()["verdict"] == "start not confirmed" and p.to_dict()["starts"] is None
+
+
+def test_skip_mm_profiling_confirms_the_start():
+    p = minicpmo_on_a5000(skip_mm_profiling=True)
+    assert p.starts is True and p.verdict == "vLLM should start" and not p.unconfirmed
+
+
+def test_sized_encoders_keep_a_plain_verdict():
+    s = vl_spec()
+    p = plan(s, weight_bytes_per_rank(s, [], 1),
+             ServeConfig(gpu_total_bytes=48 * GiB, max_model_len=4096, max_num_batched_tokens=8192))
+    assert p.starts is True and p.verdict == "vLLM should start"
+
+
+def test_errors_still_win_over_unconfirmed():
+    p = minicpmo_on_a5000(max_model_len=10**7)
+    assert p.starts is False and p.verdict == "vLLM will not start"
+
+
+def test_exit_codes():
+    from kvplan.cli import _exit_code
+    assert [_exit_code(type("P", (), {"starts": v})) for v in (True, False, None)] == [0, 1, 3]
