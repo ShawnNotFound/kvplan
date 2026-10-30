@@ -157,7 +157,7 @@ def weight_bytes_per_rank(spec: ModelSpec, tensors: list[Tensor], tp: int = 1) -
         notes.append(f"skipped {mtp / 2**30:.2f} GiB of multi-token-prediction layers, which vLLM loads only "
                      "for speculative decoding")
     buffers = spec.rotary_cache_bytes
-    if buffers:
+    if buffers >= 0.005 * 2**30:    # still counted below; a note that rounds to 0.00 GiB is just noise
         notes.append(f"includes {buffers / 2**30:.2f} GiB of RoPE cos/sin cache that vLLM allocates when it loads "
                      "the model")
     return WeightBreakdown(

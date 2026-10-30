@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The RoPE cache note is left out when it would read 0.00 GiB (small models). The cache is still counted with the weights.
+
 ## 0.1.0 (2026-10-30)
 
 First release.

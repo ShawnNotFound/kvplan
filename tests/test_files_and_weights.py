@@ -92,6 +92,16 @@ def test_tp_split_and_kv_replication(tmp_path):
     assert w4.per_rank_bytes == norms + emb4 + (q_o + mlp) // 4 + kv // 2
 
 
+def test_tiny_rope_cache_is_counted_without_a_note(tmp_path):
+    cfg = dict(CFG, rope_theta=10000.0)
+    t = llama_like_tensors(layers=2, hidden=64, heads=8, kv_heads=2, inter=128, vocab=1000)
+    m = load(LocalSource(write_model_dir(tmp_path / "m", cfg, t)))
+    w = weight_bytes_per_rank(m.spec, m.tensors)
+    # 2048 positions x 8 dims in bf16: counted, but a "0.00 GiB" note would only be noise.
+    assert w.buffer_bytes == 2048 * 8 * 2
+    assert not any("RoPE" in n for n in w.notes)
+
+
 def test_mtp_layers_are_skipped(tmp_path):
     t = llama_like_tensors(layers=3, hidden=64, heads=8, kv_heads=2, inter=128, vocab=1000)
     m = load(LocalSource(write_model_dir(tmp_path / "m", CFG, t)))   # config says 2 layers
