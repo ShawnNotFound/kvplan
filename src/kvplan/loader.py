@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .model import MissingConfigFields, ModelSpec, spec_from_config, spec_from_gguf, spec_from_tensors
+from .model import (MissingConfigFields, ModelSpec, check_against_tensors, spec_from_config, spec_from_gguf,
+                    spec_from_tensors)
 from .sources import Source, SourceError
 from .weights_meta import Tensor, gguf_files, read_gguf, read_safetensors, safetensors_files
 
@@ -31,10 +32,15 @@ def load(source: Source, gguf: str | None = None) -> LoadedModel:
     if config is not None and shards:
         tensors = read_safetensors(source, shards)
         tokenizer_config = source.read_json("tokenizer_config.json") if "tokenizer_config.json" in files else None
+        preprocessor = (source.read_json("preprocessor_config.json")
+                        if "preprocessor_config.json" in files else None)
         try:
-            spec = spec_from_config(config, tokenizer_config)
-        except MissingConfigFields:
-            spec = spec_from_tensors(tensors, config.get("model_type", "unknown"))
+            spec = spec_from_config(config, tokenizer_config, preprocessor)
+        except MissingConfigFields as e:
+            archs = config.get("architectures")
+            spec = spec_from_tensors(tensors, config.get("model_type", "unknown"), reason=str(e),
+                                     architecture=archs[0] if isinstance(archs, list) and archs else None)
+        check_against_tensors(spec, tensors)
         return LoadedModel(spec, tensors, shards)
 
     parts = gguf_files(files, prefer=gguf or None)

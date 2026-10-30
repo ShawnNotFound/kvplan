@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .model import ModelSpec
+from .model import ModelSpec, language_model_layers
 from .weights_meta import Tensor
 
 VOCAB_PADDING = 64
@@ -30,6 +30,32 @@ _REPLICATED = re.compile(r"(norm|\.router\.|e_score_correction_bias|q_a_proj|kv_
                          r"q_a_layernorm|kv_a_layernorm|\.gate\.weight$|ffn_gate_inp)")
 _LAYER_INDEX = re.compile(r"(?:^|\.)(?:layers|blk|h)\.(\d+)\.")
 _NOT_LOADED = re.compile(r"rotary_emb\.inv_freq$")
+
+# Checkpoint parts vLLM drops at load time, per architecture: the prefixes its model class maps to
+# None in hf_to_vllm_mapper (vLLM 0.32). Omni models ship a speech generator vLLM does not run.
+NOT_LOADED_PREFIXES = {
+    # vllm/model_executor/models/qwen2_5_omni_thinker.py Qwen2_5OmniThinkerForConditionalGeneration
+    "Qwen2_5OmniModel": ("talker.", "token2wav."),
+    "Qwen2_5OmniForConditionalGeneration": ("talker.", "token2wav."),
+    # vllm/model_executor/models/qwen3_omni_moe_thinker.py Qwen3OmniMoeThinkerForConditionalGeneration
+    "Qwen3OmniMoeForConditionalGeneration": ("talker.", "code2wav."),
+    # vllm/model_executor/models/qwen3_asr.py Qwen3ASRForConditionalGeneration
+    "Qwen3ASRForConditionalGeneration": ("talker.", "code2wav."),
+    # vllm/model_executor/models/minicpmo.py MiniCPMO
+    "MiniCPMO": ("tts",),
+}
+# Encoder towers vLLM builds from the plain transformers module (nn.Linear, not its tensor-parallel
+# layers), so every GPU holds a full copy.
+REPLICATED_PREFIXES = {
+    # vllm/model_executor/models/qwen2_5_omni_thinker.py: audio_tower = transformers' Qwen2_5OmniAudioEncoder
+    "Qwen2_5OmniModel": ("thinker.audio_tower.",),
+    "Qwen2_5OmniForConditionalGeneration": ("thinker.audio_tower.",),
+    # vllm/model_executor/models/qwen2_audio.py: audio_tower = transformers' Qwen2AudioEncoder
+    "Qwen2AudioForConditionalGeneration": ("audio_tower.",),
+}
+# Top-level parts that look like a speech or audio generator; for architectures not listed above,
+# kvplan counts them but warns that vLLM may not load them.
+_GENERATOR_PART = re.compile(r"^(talker|token2wav|code2wav|tts|vocoder|audio_tokenizer|audio_invert_tower)[._]")
 
 
 @dataclass
@@ -54,7 +80,7 @@ def _is_extra_layer(name: str, num_layers: int) -> bool:
     """Layers past num_hidden_layers are multi-token-prediction (MTP) heads, e.g. DeepSeek-V3's
     layer 61. vLLM loads them only for speculative decoding."""
     m = _LAYER_INDEX.search(name)
-    return bool(m) and int(m.group(1)) >= num_layers and "vision" not in name and "visual" not in name
+    return bool(m) and m.start() == 0 and int(m.group(1)) >= num_layers
 
 
 def weight_bytes_per_rank(spec: ModelSpec, tensors: list[Tensor], tp: int = 1) -> WeightBreakdown:
@@ -67,18 +93,33 @@ def weight_bytes_per_rank(spec: ModelSpec, tensors: list[Tensor], tp: int = 1) -
     notes: list[str] = []
 
     per_rank = 0.0
-    embedding = replicated = skipped = mtp = 0
+    embedding = replicated = skipped = mtp = dropped = 0
     kv_replicas = spec.num_kv_heads < tp and spec.source != "tensor shapes"
+    drop = NOT_LOADED_PREFIXES.get(spec.architecture or "", ())
+    whole = REPLICATED_PREFIXES.get(spec.architecture or "", ())
+    lm = language_model_layers(tensors)
+    lm_prefix = lm[0] if lm else ""
+    unknown_parts: dict[str, int] = {}
     for t in tensors:
         if _NOT_LOADED.search(t.name):
             skipped += t.nbytes
             continue
-        if _is_extra_layer(t.name, spec.num_layers):
+        if drop and t.name.startswith(drop):
+            skipped += t.nbytes
+            dropped += t.nbytes
+            continue
+        if not drop and (m := _GENERATOR_PART.match(t.name)):
+            unknown_parts[m.group(1)] = unknown_parts.get(m.group(1), 0) + t.nbytes
+        if t.name.startswith(lm_prefix) and _is_extra_layer(t.name[len(lm_prefix):] if lm_prefix else t.name,
+                                                             spec.num_layers):
             skipped += t.nbytes
             mtp += t.nbytes
             continue
         size = _resident_bytes(t, dtype_bytes)
-        if _EMBED.search(t.name) or _LM_HEAD.search(t.name):
+        if whole and t.name.startswith(whole):
+            per_rank += size
+            replicated += size
+        elif _EMBED.search(t.name) or _LM_HEAD.search(t.name):
             rows = t.shape[0] if t.shape else 0
             if rows and t.dtype in _FLOAT_DTYPES:
                 padded = -(-rows // VOCAB_PADDING) * VOCAB_PADDING
@@ -103,6 +144,14 @@ def weight_bytes_per_rank(spec: ModelSpec, tensors: list[Tensor], tp: int = 1) -
                 # (vllm/model_executor/layers/attention/mla_attention.py split_kv_b_proj).
                 per_rank += t.numel * dtype_bytes / tp
                 notes.append("includes the 16-bit W_UK/W_UV copies vLLM makes of quantized MLA kv_b_proj")
+    if dropped:
+        notes.append(f"skipped {dropped / 2**30:.2f} GiB under {', '.join(drop)}, which vLLM's "
+                     f"{spec.architecture} does not load")
+    if unknown_parts:
+        parts = ", ".join(f"{k} ({v / 2**30:.2f} GiB)" for k, v in sorted(unknown_parts.items()))
+        notes.append(f"WARNING: counted {parts}, which look like a speech generator; kvplan does not know "
+                     f"whether vLLM loads them for {spec.architecture or 'this architecture'}, so the weight "
+                     "figure may be too high")
     if mtp:
         notes.append(f"skipped {mtp / 2**30:.2f} GiB of multi-token-prediction layers, which vLLM loads only "
                      "for speculative decoding")

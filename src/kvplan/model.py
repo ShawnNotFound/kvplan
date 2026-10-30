@@ -12,8 +12,19 @@ from dataclasses import dataclass, field
 
 FULL, SLIDING, MLA = "full", "sliding", "mla"
 
-# Nested configs that hold the language model inside a multimodal config.
-_TEXT_CONFIG_KEYS = ("text_config", "llm_config", "language_config", "thinker_config")
+# Sub-configs transformers' PretrainedConfig.get_text_config() looks for (any one may be present).
+_TEXT_CONFIG_NAMES = ("text_encoder", "decoder", "generator", "text_config")
+# Other names vLLM maps onto text_config: llm_config (InternVL, Bagel; _CONFIG_ATTRS_MAPPING in
+# vllm/transformers_utils/config.py) and language_config (DeepSeek-VL2's config class).
+_TEXT_CONFIG_ALIASES = ("llm_config", "language_config")
+# Defaults of the transformers config classes for fields a nested text config may leave out
+# (Llava's text_config often names only model_type llama; transformers fills in LlamaConfig's defaults).
+_CONFIG_DEFAULTS = {
+    "llama": {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096, "intermediate_size": 11008,
+              "max_position_embeddings": 2048, "vocab_size": 32000},
+}
+# Sub-configs that describe multimodal encoders vLLM runs at startup to profile memory.
+_ENCODER_CONFIG_KEYS = ("vision_config", "audio_config")
 
 # Config keys that mean the model has Mamba / linear-attention layers (not supported in v0.1).
 _HYBRID_KEYS = ("layers_block_type", "hybrid_override_pattern", "attn_type_list", "full_attention_interval",
@@ -30,6 +41,16 @@ class UnsupportedModel(Exception):
 
 class MissingConfigFields(UnsupportedModel):
     """config.json lacks attention fields; the weight shapes may still describe the model."""
+
+
+@dataclass
+class EncoderSpec:
+    """A multimodal encoder (vision or audio tower) that vLLM runs during its startup profiling."""
+    kind: str                       # "vision" or "audio"
+    hidden_size: int | None
+    intermediate_size: int | None
+    spatial_merge_size: int = 1     # encoder positions per output token = merge^2
+    max_item_tokens: int | None = None  # output tokens of the largest item, when it can be derived
 
 
 @dataclass
@@ -56,6 +77,8 @@ class ModelSpec:
     source: str = "config"
     notes: list[str] = field(default_factory=list)
     intermediate_size: int | None = None   # dense MLP width; None for MoE or when unknown
+    architecture: str | None = None        # config.json "architectures"[0]
+    encoder: EncoderSpec | None = None      # multimodal encoder profiled at startup
 
     @property
     def is_mla(self) -> bool:
@@ -70,12 +93,29 @@ class ModelSpec:
         return 2
 
 
-def _text_config(cfg: dict) -> dict:
-    for key in _TEXT_CONFIG_KEYS:
-        sub = cfg.get(key)
-        if isinstance(sub, dict) and (sub.get("num_hidden_layers") or sub.get("num_layers")):
-            return sub
-    return cfg
+def text_config(top: dict) -> tuple[dict, dict, str]:
+    """(language-model config, the config that holds it, its path), resolved as vLLM 0.32 does.
+
+    vLLM's get_hf_text_config (vllm/transformers_utils/config.py) calls transformers'
+    PretrainedConfig.get_text_config(): it returns the one sub-config named text_encoder, decoder,
+    generator or text_config, the config itself when there is none, and fails when there are
+    several. Qwen2.5-Omni and Qwen3-Omni override it to return thinker_config's text config.
+    """
+    container, path = top, ""
+    thinker = top.get("thinker_config")
+    if isinstance(thinker, dict):
+        container, path = thinker, "thinker_config."
+    found = [k for k in _TEXT_CONFIG_NAMES if isinstance(container.get(k), dict)]
+    if not found:
+        found = [k for k in _TEXT_CONFIG_ALIASES if isinstance(container.get(k), dict)][:1]
+    if len(found) > 1:
+        raise UnsupportedModel(f"config.json has several language-model sub-configs ({', '.join(found)}); "
+                               "vLLM cannot pick one either")
+    if not found:
+        return container, container, path.rstrip(".") or "config.json"
+    sub = container[found[0]]
+    defaults = _CONFIG_DEFAULTS.get(sub.get("model_type"), {})
+    return {**defaults, **sub}, container, path + found[0]
 
 
 def _int_or_none(v) -> int | None:
@@ -185,6 +225,9 @@ def _check_supported(model_type: str, cfg: dict, top: dict) -> None:
             "(their per-request state is planned for a later version)")
     if cfg.get("index_topk") is not None:
         raise UnsupportedModel(f"{model_type}: sparse-attention MLA (DeepSeek V3.2 style) is not supported yet")
+    if cfg.get("global_head_dim") or cfg.get("num_global_key_value_heads"):
+        raise UnsupportedModel(f"{model_type}: full-attention layers with their own head size or KV-head count "
+                               "(Gemma 4 style) are not supported yet")
     if cfg.get("attention_chunk_size"):
         raise UnsupportedModel(f"{model_type}: chunked local attention (Llama 4 style) is not supported yet")
     if cfg.get("kv_lora_rank") is not None and model_type not in _MLA_TYPES:
@@ -211,8 +254,30 @@ def kv_cache_dtype_from_quant(quant: dict | None) -> str | None:
     return None
 
 
-def spec_from_config(top: dict, tokenizer_config: dict | None = None) -> ModelSpec:
-    cfg = _text_config(top)
+def encoder_spec(container: dict, preprocessor: dict | None) -> EncoderSpec | None:
+    """The multimodal encoder vLLM profiles at startup, from the config that holds the text config."""
+    for key in _ENCODER_CONFIG_KEYS:
+        enc = container.get(key)
+        if not isinstance(enc, dict):
+            continue
+        hidden = _int_or_none(_first(enc, "hidden_size", "d_model", "embed_dim", "width"))
+        inter = _int_or_none(_first(enc, "intermediate_size", "encoder_ffn_dim", "mlp_dim", "ffn_dim"))
+        merge = _int_or_none(enc.get("spatial_merge_size")) or 1
+        patch = _int_or_none(enc.get("patch_size"))
+        max_pixels = None
+        if preprocessor:
+            size = preprocessor.get("size") if isinstance(preprocessor.get("size"), dict) else {}
+            max_pixels = _int_or_none(preprocessor.get("max_pixels")) or _int_or_none(size.get("longest_edge"))
+        # Qwen2-VL-style processors: the largest item has max_pixels / (patch * merge)^2 tokens
+        # (Qwen2VLProcessingInfo.get_image_size_with_most_features in vllm/model_executor/models/qwen2_vl.py).
+        item_tokens = max_pixels // (patch * merge) ** 2 if (max_pixels and patch and merge > 1) else None
+        return EncoderSpec(kind=key.split("_")[0], hidden_size=hidden, intermediate_size=inter,
+                           spatial_merge_size=merge, max_item_tokens=item_tokens)
+    return None
+
+
+def spec_from_config(top: dict, tokenizer_config: dict | None = None, preprocessor: dict | None = None) -> ModelSpec:
+    cfg, container, path = text_config(top)
     model_type = cfg.get("model_type") or top.get("model_type") or "unknown"
     _check_supported(model_type, cfg, top)
 
@@ -237,6 +302,8 @@ def spec_from_config(top: dict, tokenizer_config: dict | None = None) -> ModelSp
         head_dim = hidden // heads
 
     notes = []
+    if path != "config.json":
+        notes.append(f"language model read from {path}")
     kv_lora_rank = cfg.get("kv_lora_rank")
     qk_rope = cfg.get("qk_rope_head_dim")
     if kv_lora_rank is not None:
@@ -294,7 +361,14 @@ def spec_from_config(top: dict, tokenizer_config: dict | None = None) -> ModelSp
         notes=notes,
         intermediate_size=None if experts else _int_or_none(_first(cfg, "intermediate_size", "ffn_hidden_size",
                                                                    "n_inner")),
+        architecture=_architecture(top),
+        encoder=encoder_spec(container, preprocessor),
     )
+
+
+def _architecture(top: dict) -> str | None:
+    archs = top.get("architectures")
+    return archs[0] if isinstance(archs, list) and archs and isinstance(archs[0], str) else None
 
 
 # ------------------------------------------------------------------- GGUF
@@ -360,30 +434,97 @@ def spec_from_gguf(meta: dict) -> ModelSpec:
 
 # --------------------------------------------------------------- tensor shapes
 
-_LAYER_RE = re.compile(r"\.(?:layers|h|blocks|layer)\.(\d+)\.")
+_LAYER_RE = re.compile(r"^((?:[^.]*\.)*?)(?:layers|h|blocks|layer)\.(\d+)\.")
+_K_PROJ_RE = re.compile(r"\.(k_proj|key)\.weight$")
+# Prefixes of multimodal encoders and speech-output parts; their layers are not the language model's.
+_NON_LM_PREFIX = re.compile(r"vision|visual|vit\b|siglip|clip|image|audio|whisper|encoder|mm_projector|"
+                            r"talker|token2wav|code2wav|tts|vocoder", re.I)
+# Checkpoint dtypes whose shape is the logical shape (packed quantized formats are not).
+_PLAIN_DTYPES = {"F32", "F16", "BF16", "F64", "F8_E4M3", "F8_E5M2"}
 
 
-def spec_from_tensors(tensors, model_type: str = "unknown") -> ModelSpec:
+def language_model_layers(tensors) -> tuple[str, int] | None:
+    """(name prefix, layer count) of the language model's transformer layers in the weights.
+
+    Layers under encoder or speech-output prefixes are ignored. With several candidates, the
+    one with the most layers wins (a language model's prefix also holds its MTP layers).
+    """
+    groups: dict[str, set[int]] = {}
+    for t in tensors:
+        m = _LAYER_RE.search(t.name)
+        if m and not _NON_LM_PREFIX.search(m.group(1)):
+            groups.setdefault(m.group(1), set()).add(int(m.group(2)))
+    if not groups:
+        return None
+    prefix = max(groups, key=lambda p: (len(groups[p]), -len(p)))
+    return prefix, max(groups[prefix]) + 1
+
+
+def kv_widths_from_tensors(tensors, prefix: str) -> dict[int, int]:
+    """Output rows of each layer's K projection (num_kv_heads * head_dim) under the language model prefix."""
+    out = {}
+    for t in tensors:
+        if not t.name.startswith(prefix) or not _K_PROJ_RE.search(t.name) or len(t.shape) != 2:
+            continue
+        if t.dtype not in _PLAIN_DTYPES:
+            continue
+        m = _LAYER_RE.search(t.name)
+        if m and m.group(1) == prefix:
+            out[int(m.group(2))] = t.shape[0]
+    return out
+
+
+def check_against_tensors(spec: ModelSpec, tensors) -> None:
+    """Refuse when the config's attention geometry contradicts the language model's weights."""
+    if spec.is_mla or spec.source != "config":
+        return
+    lm = language_model_layers(tensors)
+    if lm is None:
+        return
+    prefix, n = lm
+    widths = kv_widths_from_tensors(tensors, prefix)
+    expected = spec.num_kv_heads * spec.head_dim
+    bad = sorted({w for w in widths.values() if w != expected})
+    if bad:
+        raise UnsupportedModel(
+            f"{spec.model_type}: the config gives {spec.num_kv_heads} KV heads x head_dim {spec.head_dim} = "
+            f"{expected} K channels per layer, but the weights under '{prefix}' have {bad}. kvplan will not "
+            "guess which is right; check config.json (or the sub-config it was read from) against the "
+            "checkpoint, or report the model at https://github.com/ShawnNotFound/kvplan/issues")
+    if n < spec.num_layers:
+        raise UnsupportedModel(
+            f"{spec.model_type}: the config gives {spec.num_layers} layers, but the weights under '{prefix}' "
+            f"have only {n}. kvplan will not guess which is right; check config.json against the checkpoint")
+
+
+def spec_from_tensors(tensors, model_type: str = "unknown", reason: str = "config.json has no attention fields",
+                      architecture: str | None = None) -> ModelSpec:
     """Fallback when config.json lacks the attention fields: derive them from weight shapes.
 
-    Layer count comes from the layer indices in tensor names. The KV width per layer
-    (num_kv_heads * head_dim) comes from the K projection's output rows, which is all
+    Layer count comes from the layer indices of the language model's tensors. The KV width per
+    layer (num_kv_heads * head_dim) comes from the K projection's output rows, which is all
     the KV-cache size needs. Head counts themselves cannot be recovered exactly, so
     tensor-parallel checks are skipped for such models.
     """
-    layers = {int(m.group(1)) for t in tensors for m in [_LAYER_RE.search(t.name)] if m}
-    if not layers:
+    lm = language_model_layers(tensors)
+    if lm is None:
         raise UnsupportedModel(f"{model_type}: cannot find transformer layers in the weight names")
-    k = [t for t in tensors if re.search(r"\.(k_proj|key)\.weight$", t.name) and len(t.shape) == 2]
-    if not k:
-        raise UnsupportedModel(f"{model_type}: no separate K projection in the weights; cannot derive the KV width")
-    kv_width = k[0].shape[0]
-    emb = [t for t in tensors if re.search(r"(embed_tokens|wte|word_embeddings|tok_embeddings)\.weight$", t.name)]
+    prefix, n = lm
+    widths = kv_widths_from_tensors(tensors, prefix)
+    if not widths:
+        raise UnsupportedModel(f"{model_type}: no separate K projection in the language model's weights; "
+                               "cannot derive the KV width")
+    if len(set(widths.values())) > 1:
+        raise UnsupportedModel(f"{model_type}: K projections of different widths across layers "
+                               f"({sorted(set(widths.values()))}); per-layer KV sizes are not supported yet")
+    kv_width = next(iter(widths.values()))
+    emb = [t for t in tensors if t.name.startswith(prefix)
+           and re.search(r"(embed_tokens|wte|word_embeddings|tok_embeddings)\.weight$", t.name)]
     vocab, hidden = (emb[0].shape[0], emb[0].shape[1]) if emb and len(emb[0].shape) == 2 else (None, None)
     return ModelSpec(
-        model_type=model_type, num_layers=max(layers) + 1, hidden_size=hidden, num_heads=1, num_kv_heads=1,
+        model_type=model_type, num_layers=n, hidden_size=hidden, num_heads=1, num_kv_heads=1,
         head_dim=kv_width, v_head_dim=kv_width, vocab_size=vocab, max_position_embeddings=None,
-        layer_types=[FULL] * (max(layers) + 1), source="tensor shapes",
-        notes=["attention geometry derived from weight shapes; head counts unknown, so the KV size assumes "
-               "no tensor-parallel head replication"],
+        layer_types=[FULL] * n, source="tensor shapes", architecture=architecture,
+        notes=[f"attention geometry derived from the weight shapes under '{prefix}' because {reason}; "
+               "head counts are unknown, so the KV size assumes no tensor-parallel head replication"],
     )

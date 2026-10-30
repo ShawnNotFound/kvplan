@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field
 
 from .kv import KVCapacity, kv_capacity, kv_layout, resolve_kv_cache_dtype
 from .model import ModelSpec
+from .vllm_architectures import VLLM_ARCHITECTURES
 from .weights import WeightBreakdown
 
 GiB = 2**30
@@ -105,13 +106,56 @@ class Overheads:
     non_torch_bytes: int
     user_override: bool = False
     calibrated: bool = True   # False when the model falls outside what was measured (MoE, unknown MLP)
+    encoder_bytes: int = 0    # approximate extra peak from profiling the multimodal encoder
+    encoder_note: str = ""
 
     @property
     def total(self) -> int:
-        return self.activation_bytes + self.compile_bytes + self.cudagraph_bytes + self.non_torch_bytes
+        return (self.activation_bytes + self.compile_bytes + self.cudagraph_bytes + self.non_torch_bytes
+                + self.encoder_bytes)
 
 
-def estimate_overheads(spec: ModelSpec, cfg: ServeConfig, batched_tokens: int, num_seqs: int) -> Overheads:
+def encoder_profile_bytes(spec: ModelSpec, tp: int, batched_tokens: int, num_seqs: int, max_model_len: int,
+                          text_activation: int) -> tuple[int, str]:
+    """Approximate extra peak from vLLM's multimodal encoder profiling, and a note saying how it was derived.
+
+    GPUModelRunner.profile_run (vllm/v1/worker/gpu_model_runner.py) first runs the encoder on a
+    batch of dummy items of the largest size, keeps the outputs in the encoder cache, then runs the
+    text forward pass. The encoder budget is max(max_num_batched_tokens, tokens of the largest item)
+    (compute_mm_encoder_budget in vllm/v1/core/encoder_cache_manager.py), and the batch holds
+    budget // item_tokens items (MultiModalBudget._get_max_items in vllm/multimodal/encoder_budget.py).
+
+    The encoder's own activation peak is not measured: it is approximated with the same rule as the
+    text model's MLP peak (2 x the gate/up output over every encoder position), so the result is
+    labelled approximate.
+    """
+    enc = spec.encoder
+    if enc is None:
+        return 0, ""
+    dtype = spec.model_dtype_bytes
+    item = enc.max_item_tokens
+    budget = max(batched_tokens, item or 0)
+    if item:
+        per_prompt = max(1, max_model_len // item)
+        items = max(1, min(budget // item, num_seqs * per_prompt))
+        out_tokens = items * item
+        how = f"{items} item(s) of {item:,} tokens"
+    else:
+        out_tokens = budget
+        how = f"an assumed {budget:,}-token item (the largest item size could not be derived)"
+    out_bytes = out_tokens * (spec.hidden_size or 0) * dtype
+    positions = out_tokens * enc.spatial_merge_size ** 2
+    inter = enc.intermediate_size or (4 * enc.hidden_size if enc.hidden_size else 0)
+    enc_peak = positions * inter * 2 * dtype * MLP_PEAK_FACTOR // tp
+    extra = max(enc_peak - text_activation, 0) + out_bytes
+    note = (f"APPROXIMATE: includes {extra / GiB:.2f} GiB for vLLM's startup profiling of the {enc.kind} encoder "
+            f"({how}); kvplan has not been calibrated on encoder memory, so the KV figure may be off by a few "
+            "percent. vLLM's --skip-mm-profiling or --limit-mm-per-prompt change this")
+    return extra, note
+
+
+def estimate_overheads(spec: ModelSpec, cfg: ServeConfig, batched_tokens: int, num_seqs: int,
+                       max_model_len: int = 0) -> Overheads:
     if cfg.overhead_bytes is not None:
         return Overheads(cfg.overhead_bytes, 0, 0, 0, user_override=True)
     vocab = spec.vocab_size or 32000
@@ -130,7 +174,9 @@ def estimate_overheads(spec: ModelSpec, cfg: ServeConfig, batched_tokens: int, n
         activation, calibrated = batched_tokens * hidden * dtype * 12 // cfg.tp + 2 * logits, False
     compiled = 0 if cfg.enforce_eager else batched_tokens * hidden * dtype * COMPILE_ACTIVATION_FACTOR // cfg.tp
     graphs = 0 if cfg.enforce_eager else CUDAGRAPH_BYTES
-    return Overheads(activation, compiled, graphs, NON_TORCH_BYTES, calibrated=calibrated)
+    encoder, note = encoder_profile_bytes(spec, cfg.tp, batched_tokens, num_seqs, max_model_len, activation)
+    return Overheads(activation, compiled, graphs, NON_TORCH_BYTES, calibrated=calibrated,
+                     encoder_bytes=encoder, encoder_note=note)
 
 
 @dataclass
@@ -183,7 +229,14 @@ def plan(spec: ModelSpec, weights: WeightBreakdown, cfg: ServeConfig, model_name
         if not spec.is_mla and spec.num_kv_heads % tp and tp % spec.num_kv_heads:
             checks.append(Check(False, "error", f"{spec.num_kv_heads} KV heads cannot be split or replicated "
                                                 f"evenly over {tp} GPUs"))
-    if spec.num_kv_heads < tp and not spec.is_mla:
+    if spec.source == "tensor shapes":
+        checks.append(Check(True, "warning", "UNCERTAIN: the attention geometry was derived from weight shapes, "
+                                             "not from config.json, so the KV figures may be wrong"))
+    if spec.architecture and spec.architecture not in VLLM_ARCHITECTURES:
+        checks.append(Check(True, "warning", f"UNCERTAIN: vLLM 0.32 has no native implementation of "
+                                             f"{spec.architecture}; it may refuse the model or run it through "
+                                             "the Transformers backend, whose memory use kvplan has not measured"))
+    if spec.num_kv_heads < tp and not spec.is_mla and spec.source != "tensor shapes":
         checks.append(Check(True, "info", f"only {spec.num_kv_heads} KV heads for {tp} GPUs: each GPU keeps a "
                                           "replicated head, so KV memory does not shrink further with more GPUs"))
 
@@ -214,7 +267,7 @@ def plan(spec: ModelSpec, weights: WeightBreakdown, cfg: ServeConfig, model_name
         suggestions.append(f"lower --gpu-memory-utilization to "
                            f"{math.floor(free_at_start / cfg.gpu_total_bytes * 100) / 100:.2f}")
 
-    over = estimate_overheads(spec, cfg, batched, seqs)
+    over = estimate_overheads(spec, cfg, batched, seqs, max_model_len)
     memory_short = False
     if weights.per_rank_bytes > requested:
         memory_short = True

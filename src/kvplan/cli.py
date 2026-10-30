@@ -101,6 +101,10 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+def spec_kind(spec) -> str:
+    return spec.encoder.kind if spec.encoder else ""
+
+
 def _parse_indices(text: str | None) -> list[int] | None:
     if text is None:
         return None
@@ -176,7 +180,9 @@ def cmd_check(args) -> int:
     else:
         print(f"  runtime        {_gib(o.total)} estimated: activation peak {_gib(o.activation_bytes)}, "
               f"torch.compile {_gib(o.compile_bytes)}, CUDA graphs {_gib(o.cudagraph_bytes)}, "
-              f"other {_gib(o.non_torch_bytes)}")
+              f"other {_gib(o.non_torch_bytes)}"
+              + (f", {spec_kind(loaded.spec)} encoder profiling {_gib(o.encoder_bytes)} (approximate)"
+                 if o.encoder_bytes else ""))
     print(f"  KV cache       {_gib(max(p.available_kv_bytes, 0))} available "
           f"({p.kv_bytes_per_token:,} bytes per token per GPU, {p.kv_cache_dtype}, block size {p.block_size})")
     if p.kv is not None:
@@ -191,6 +197,8 @@ def cmd_check(args) -> int:
         print(f"  try            {s}")
     for n in loaded.spec.notes + w.notes:
         print(f"  note           {n}")
+    if o.encoder_note and not o.user_override:
+        print(f"  note           {o.encoder_note}")
     if not o.user_override and not o.calibrated:
         print("  note           runtime overheads for this model are a rough estimate: they were calibrated on "
               "dense models only; pass --overhead-gib to override")
