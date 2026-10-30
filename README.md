@@ -22,7 +22,7 @@ unsloth/Meta-Llama-3.1-8B-Instruct on 1 x L4 (max_model_len 131072, max_num_seqs
   try            --tensor-parallel-size 2 on 2 GPUs splits weights and KV further
 ```
 
-> **Status: alpha.** Weight and KV sizes are computed exactly from the model files. The runtime overheads (activation peak, torch.compile buffers, CUDA graphs) are fitted to vLLM 0.32 startup logs from 15 runs on RTX A6000 and A5000 GPUs; see [Accuracy](https://github.com/ShawnNotFound/kvplan#accuracy) for what that does and does not cover.
+> **Status: alpha.** Weight and KV sizes are computed exactly from the model files. The runtime overheads (activation peak, torch.compile buffers, CUDA graphs) are fitted to vLLM 0.32 startup logs from text-model runs on RTX A6000 and A5000 GPUs, and the multimodal encoder memory is derived from vLLM's code and checked on 27 more runs; see [Accuracy](https://github.com/ShawnNotFound/kvplan#accuracy) for what that does and does not cover.
 
 ## Why
 
@@ -81,7 +81,7 @@ openai/gpt-oss-20b
 | | |
 |---|---|
 | Model metadata | config.json, including nested language-model configs (`text_config`, `thinker_config`, `llm_config`, `language_config`) resolved as vLLM does; safetensors headers; GGUF headers. A tensor-shape fallback when config.json lacks fields (flagged as uncertain), and a refusal when config and weights disagree |
-| Multimodal | checkpoint parts vLLM does not load (Omni speech generators) are skipped; an approximate term for vLLM's startup encoder profiling, flagged in the output |
+| Multimodal | checkpoint parts vLLM does not load (Omni speech generators) are skipped; vLLM's startup encoder profiling is reproduced for the Qwen2-VL family (dummy items, encoder memory), approximated for Whisper-style audio and flagged as uncertain for other encoders; `--limit-mm-per-prompt`, `--mm-processor-kwargs` and `--skip-mm-profiling` as in vLLM |
 | Attention | MHA, GQA, MQA, sliding-window and hybrid full/sliding layouts (Gemma 2/3, gpt-oss, Cohere2, Qwen2/3 with sliding window), MLA (DeepSeek V2/V3, Kimi K2) |
 | Weights | exact bytes per tensor, 16-bit loading of fp32 checkpoints, quantised formats at their stored size, vocab padding, tied embeddings, MTP layers excluded, tensor-parallel sharding and KV-head replication |
 | vLLM | utilisation budget, free-memory check, KV block grouping and rounding, max concurrency, the max_model_len check and its suggested length |
@@ -92,7 +92,12 @@ In a sample of the 300 most-downloaded text-generation models on Hugging Face, k
 
 ## Accuracy
 
-Checked against vLLM 0.32.0 on an RTX A6000 and RTX A5000s with four dense models (Qwen2.5 1.5B, Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B), with and without CUDA graphs, at tensor parallelism 1 and 2. kvplan's KV-cache token count was within 0.7% of vLLM's in 14 of 15 runs and within 1.9% in all of them; before calibration (v0.1) it was within 2.7%. The calibration was fitted to these same runs, so these are in-sample numbers: other GPUs, vLLM versions, MoE and quantised models have not been measured yet. In out-of-sample runs on two RTX A6000s at tensor parallelism 2, Llama 3.1 8B was within 0.13%. The multimodal runs exposed two bugs: Qwen2.5-Omni was 83% low (its nested config was not read) and Qwen2.5-VL 7B was 2.7–3.6% high (vLLM's encoder profiling was not modelled). After fixing them, Qwen2.5-Omni is within 0.4% and Qwen2.5-VL is 1.6–2.5% high; the encoder term is approximate and kvplan says so in its output. The full table, method and known gaps are in [docs/validation.md](https://github.com/ShawnNotFound/kvplan/blob/master/docs/validation.md).
+Checked against vLLM 0.32.0 on RTX A6000 and RTX A5000 GPUs.
+
+- **Text models** (Qwen2.5 1.5B, Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B; CUDA graphs and eager; tensor parallelism 1 and 2): kvplan's KV-cache token count is within 1.9% of vLLM's in all 15 runs (mean 0.5%). These runs were used for calibration, so they are in-sample. On two RTX A6000s at tensor parallelism 2, which were not used, Llama 3.1 8B is within 0.22%.
+- **Multimodal models:** kvplan reproduces the dummy images and videos vLLM profiles at startup for Qwen2-VL, Qwen2.5-VL and Qwen2.5-Omni, including the effect of `--mm-processor-kwargs` max_pixels and `--limit-mm-per-prompt`, and derives the vision encoder's memory from vLLM's code. On 16 fit runs (Qwen2.5-VL 7B, Qwen2.5-Omni 3B and 7B, Qwen2-Audio 7B on an A6000) it is within 0.72%; on 11 held-out runs (A5000, tensor parallelism 2) within 2.24%. Other encoders are not sized: for MiniCPM-o 2.6 kvplan was 19–23% high, and it now warns that the figure is uncertain for any encoder it cannot size.
+
+Not measured yet: MoE and quantised models, other vLLM versions, Hopper or Blackwell GPUs. The full table, method and known gaps are in [docs/validation.md](https://github.com/ShawnNotFound/kvplan/blob/master/docs/validation.md).
 
 ## Roadmap
 

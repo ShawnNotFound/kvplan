@@ -68,9 +68,86 @@ vLLM was run again with the same settings; it reported exactly the same numbers 
 | 2× RTX A6000 | Qwen/Qwen2.5-Omni-7B | eager | 2 | 8192 | 4096 | 9.01 / 8.91 | 1.11 / 1.19 | 32.54 / 32.55 | 1,218,704 / 1,214,248 | 297.54 / 296.45 | -83.2% | -0.37% |
 
 - **Qwen2.5-Omni 7B:** kvplan now reads `thinker_config.text_config` (28,672 KV bytes per token per GPU, as vLLM), skips 4.19 GiB of talker and token2wav weights, and keeps the audio tower whole on each GPU. It is within 0.4% of vLLM.
-- **Qwen2.5-VL 7B:** the encoder term adds 0.37 GiB, which removes 31–41% of the error. vLLM's measured peak is still 0.5–0.75 GiB above kvplan's, and its weights are 0.18 GiB above (cause not found; the vision tower is split across GPUs in vLLM 0.32, as kvplan assumes). kvplan prints a warning that the multimodal figures are approximate.
+- **Qwen2.5-VL 7B:** the encoder term adds 0.37 GiB, which removes 31–41% of the error. vLLM's measured peak is still 0.5–0.75 GiB above kvplan's, and its weights are 0.18 GiB above (explained in the next section: the M-RoPE cache). kvplan prints a warning that the multimodal figures are approximate.
 - The encoder term is not a good physical model yet: the same vision encoder and the same 16,384-token item give a 1.33 GiB peak in Qwen2.5-VL but 0.66 GiB in Qwen2.5-Omni (eager). It is labelled approximate for that reason.
 - All 15 in-sample text-model runs give exactly the same kvplan numbers after the fix.
+
+## Multimodal profiling, measured (2026-10-30, second round)
+
+Goal: replace the approximate encoder term with one derived from vLLM's code, and check it on runs that were not used to build it.
+
+**Method.** 34 vLLM 0.32 startups of cached multimodal models on the same machine (RTX A6000 and RTX A5000, `gpu_memory_utilization` 0.9, bf16, 8192 batched tokens, `max_model_len` 4096 unless stated). They vary `max_pixels` (default 12,845,056, 1,003,520 and 3,211,264), `--limit-mm-per-prompt` (default, image only, no video), `max_model_len` (4096 and 8192), TP 1 and 2, eager and CUDA graphs, and the GPU. A small instrumentation module loaded into every vLLM process (`sitecustomize`, no change to vLLM's behaviour) recorded torch's allocated and peak memory before and after the encoder pass inside `profile_run`, the dummy items vLLM built, and, for one run, every parameter and buffer on rank 0.
+
+**Split, fixed before modelling.** Fit set: the A6000 TP 1 runs of Qwen2.5-VL-7B, Qwen2.5-Omni-7B, Qwen2.5-Omni-3B and Qwen2-Audio-7B. Holdout: every A5000 run, every TP 2 run, and every run of the MiniCPM-o 2.6 and Voxtral-Mini-3B families. The fit set was used to check the derivations in docs/accounting.md (sections 3 and 8) and to set one constant (below); no holdout run influenced the model.
+
+Not runnable: Voxtral-Mini-3B (vLLM 0.32 fails to load it from this cache: `VoxtralEncoderConfig` has no `downsample_factor`, also with `tokenizer_mode mistral`), ultravox-v0.5 (needs Llama-3.1-8B-Instruct weights that are not cached) and VITA-1.5 (weights not cached).
+
+**What was found.**
+
+- Every dummy batch kvplan predicts for the Qwen family matches what vLLM built: modality, item count, tokens and encoder positions (16 configurations).
+- The Qwen2.5-VL vision tower's peak is linear in encoder positions: 29.9 KB per position at TP 1 and 22.2 KB at TP 2 over 30,720–65,536 positions. The live-tensor derivation (accounting.md, section 8) gives 29.4 and 21.7 KB.
+- Qwen2.5-Omni profiles a 729-token video, not the 16,384 tokens vLLM budgets for, because its HF processor resizes video frames; without video it profiles a 16,384-token image and the peak goes from 0.1 to 1.9 GiB.
+- With CUDA graphs on, the encoder pass is unchanged in kind (it runs eagerly) and vLLM's reported peak adds its CUDA-graph estimate.
+- **The 0.18 GiB weight gap on Qwen2.5-VL at TP 2:** parameters match kvplan exactly (7.724 GiB). vLLM also allocates the language model's M-RoPE cos/sin cache, a [512000, 128] bf16 buffer (4 × max_position_embeddings × head_dim): 0.122 GiB. kvplan now counts RoPE caches with the weights. The remaining 0.05 GiB is other memory still allocated at the end of loading; not modelled.
+- **Non-torch memory is higher for multimodal models:** 0.39–0.57 GiB on the fit runs (median 0.45) against 0.22–0.46 for text models. kvplan could not trace it to a vLLM allocation, so it adds a fitted 0.20 GiB for models with an encoder (median of the fit set minus the 0.25 GiB text value).
+
+Errors are kvplan's KV-token count against vLLM's. "Profiled peak" is vLLM's "peak activation" (including its CUDA-graph estimate) next to kvplan's activation + torch.compile + encoder + CUDA-graph terms.
+
+### Fit set (A6000, TP 1)
+
+| GPU | Model | Mode | Settings | Profiled items (vLLM) | Encoder peak GiB (measured) | Profiled peak GiB (vLLM / kvplan) | KV tokens (vLLM / kvplan) | Error |
+|---|---|---|---|---|---|---|---|---|
+| RTX A6000 | Qwen2.5-VL-7B | eager | defaults | 1 video × 16,384 | 1.82 | 1.80 / 1.79 | 463,952 / 463,485 | -0.10% |
+| RTX A6000 | Qwen2.5-VL-7B | eager | max_pixels 1,003,520 | 2 video × 3,840 | 0.86 | 1.10 / 1.21 | 477,568 / 474,402 | -0.66% |
+| RTX A6000 | Qwen2.5-VL-7B | eager | max_pixels 3,211,264 | 2 video × 4,096 | 0.91 | 1.09 / 1.21 | 477,792 / 474,339 | -0.72% |
+| RTX A6000 | Qwen2.5-VL-7B | eager | limit image 1, video 0 | 1 image × 16,384 | 1.82 | 1.80 / 1.79 | 463,952 / 463,485 | -0.10% |
+| RTX A6000 | Qwen2.5-VL-7B | eager | max_model_len 8192 | 1 video × 16,384 | 1.82 | 1.80 / 1.79 | 463,952 / 464,388 | +0.09% |
+| RTX A6000 | Qwen2.5-VL-7B | eager | max_pixels 1,003,520; max_model_len 8192 | 1 video × 7,680 | 0.86 | 1.10 / 1.21 | 477,568 / 475,327 | -0.47% |
+| RTX A6000 | Qwen2-Audio-7B | eager | defaults | 10 audio × 750 | 0.50 | 0.78 / 0.73 | 52,800 / 52,912 | +0.21% |
+| RTX A6000 | Qwen2.5-VL-7B | CUDA graphs | defaults | 1 video × 16,384 | 2.14 | 2.53 / 2.43 | 450,320 / 451,675 | +0.30% |
+| RTX A6000 | Qwen2.5-Omni-7B | eager | defaults | 1 video × 729 | 0.09 | 1.04 / 1.16 | 455,680 / 454,735 | -0.21% |
+| RTX A6000 | Qwen2.5-Omni-7B | eager | limit video 0 | 1 image × 16,384 | 1.89 | 1.88 / 1.86 | 439,568 / 441,618 | +0.47% |
+| RTX A6000 | Qwen2.5-Omni-7B | eager | max_pixels 1,003,520 | 2 video × 3,840 | 0.90 | 1.10 / 1.21 | 454,528 / 453,875 | -0.14% |
+| RTX A6000 | Qwen2.5-Omni-3B | eager | defaults | 1 video × 729 | 0.09 | 0.61 / 0.67 | 951,472 / 950,001 | -0.15% |
+| RTX A6000 | Qwen2.5-Omni-3B | eager | limit video 0 | 1 image × 16,384 | 1.89 | 1.88 / 1.86 | 913,936 / 915,463 | +0.17% |
+| RTX A6000 | Qwen2.5-Omni-3B | eager | max_model_len 8192 | 1 video × 729 | 0.09 | 0.61 / 0.67 | 951,472 / 951,852 | +0.04% |
+| RTX A6000 | Qwen2-Audio-7B | eager | max_model_len 8192 | 10 audio × 750 | 0.50 | 0.78 / 0.73 | 52,800 / 52,912 | +0.21% |
+| RTX A6000 | Qwen2.5-Omni-3B | CUDA graphs | defaults | 1 video × 729 | 0.11 | 1.04 / 1.14 | 938,848 / 936,390 | -0.26% |
+
+Within 0.72% in all 16 runs (mean absolute error 0.27%).
+
+### Holdout
+
+| GPU | Model | Mode | Settings | Profiled items (vLLM) | Encoder peak GiB (measured) | Profiled peak GiB (vLLM / kvplan) | KV tokens (vLLM / kvplan) | Error |
+|---|---|---|---|---|---|---|---|---|
+| RTX A6000 | MiniCPM-o-2.6 | eager | defaults | 8 video × 1,024 | 5.95 | 5.94 / 1.21 | 384,128 / 471,900 | +22.85% |
+| RTX A6000 | MiniCPM-o-2.6 | eager | limit image 1, audio 0, video 0 | 12 image × 640 | 5.81 | 5.75 / 1.21 | 398,048 / 471,900 | +18.55% |
+| RTX A5000 | Qwen2.5-VL-7B | eager | defaults | 1 video × 16,384 | 1.82 | 1.80 / 1.79 | 62,144 / 63,113 | +1.56% |
+| RTX A5000 | Qwen2.5-VL-7B | eager | max_pixels 1,003,520 | 2 video × 3,840 | 0.86 | 1.10 / 1.21 | 75,744 / 74,046 | -2.24% |
+| RTX A5000 | Qwen2.5-Omni-3B | eager | defaults | 1 video × 729 | 0.09 | 0.61 / 0.67 | 326,416 / 327,217 | +0.25% |
+| RTX A5000 | Qwen2.5-Omni-3B | eager | limit video 0 | 1 image × 16,384 | 1.89 | 1.88 / 1.86 | 288,896 / 292,680 | +1.31% |
+| RTX A5000 | Qwen2-Audio-7B | eager | defaults | 10 audio × 750 | 0.50 | 0.78 / 0.73 | 8,864 / 8,944 | +0.90% |
+| RTX A5000 | MiniCPM-o-2.6 | eager | defaults | 8 video × 1,024 | 5.95 | – / 1.21 | vLLM: no memory for the KV cache / kvplan: 71,544 | kvplan says it starts |
+| RTX A5000 | Qwen2.5-Omni-3B | eager | max_pixels 1,003,520 | 2 video × 3,840 | 0.90 | 0.89 / 0.87 | 318,320 / 321,432 | +0.98% |
+| RTX A5000 | Qwen2.5-VL-7B | eager | limit image 1, video 0 | 1 image × 16,384 | 1.82 | 1.80 / 1.79 | 62,144 / 63,113 | +1.56% |
+| RTX A5000 | MiniCPM-o-2.6 | eager | max_model_len 8192 | 8 video × 1,024 | 5.95 | – / 1.21 | vLLM: no memory for the KV cache / kvplan: 71,683 | kvplan says it starts |
+| 2× RTX A6000 | Qwen2.5-Omni-3B | eager | defaults | 1 video × 729 | 0.07 | 0.38 / 0.34 | 2,142,448 / 2,139,179 | -0.15% |
+| 2× RTX A6000 | Qwen2.5-VL-7B | eager | max_pixels 1,003,520 | 2 video × 3,840 | 0.66 | 0.72 / 0.63 | 1,262,560 / 1,258,428 | -0.33% |
+| 2× RTX A5000 | Qwen2.5-VL-7B | eager | defaults | 1 video × 16,384 | 1.35 | 1.33 / 1.32 | 434,848 / 431,833 | -0.69% |
+| 2× RTX A5000 | Qwen2-Audio-7B | eager | defaults | 10 audio × 750 | 0.50 | 0.60 / 0.39 | 48,208 / 48,880 | +1.39% |
+
+- **Qwen family and Qwen2-Audio on held-out GPUs and TP:** within 2.24% in all 11 runs (mean absolute error 1.03%). The A5000 rows have small KV pools (3–11 GiB), so a 0.05 GiB error is 1–2% there.
+- **Qwen2-Audio at TP 2:** kvplan's audio-encoder rule is 25% low, and at TP 2 the encoder sets the peak; +1.39%.
+- **MiniCPM-o 2.6 is not modelled:** vLLM profiles 8 videos (or 12 images) and the encoder pass peaks at 5.8–5.9 GiB; kvplan's generic estimate is 1.2 GiB, so it is 19–23% high on the A6000 and says the model starts on an A5000 where vLLM runs out of memory. kvplan now prints an UNCERTAIN warning for every encoder it cannot size, naming this range. With the image-only limit vLLM also skips loading MiniCPM-o's audio tower (0.6 GiB less weight); kvplan does not model that.
+- **Bug found by the holdout:** Qwen2-Audio's `text_config` names only `model_type: qwen2`, so kvplan fell back to weight shapes and, at TP 2, kept the whole KV width on each GPU (-49.7%). kvplan now fills in transformers' `Qwen2Config` defaults (32 KV heads) and, when it does fall back to weight shapes, splits the KV width across GPUs. The table shows the fixed result.
+
+### Effect on other models
+
+Checked on the 204 ungated models of the top-300 Hugging Face text-generation list, 2 × H100-80GB, TP 2, from local copies of their configs and safetensors headers. No KV size per token or start/no-start result changed. The RoPE cache adds a median of 0.01 GiB per GPU (most 0.03 GiB or less, at most 0.375 GiB for a 1M-context model with two caches). Three multimodal models also get the encoder terms: Qwen2.5-VL-7B NVFP4 (-0.70 GiB of KV), and Qwen3-VL-30B-A3B AWQ and Kimi-K2.5 NVFP4 (-0.42 and -0.23 GiB, both flagged UNCERTAIN). 64 models fail as before (unsupported architectures).
+
+### Earlier runs with the current kvplan
+
+The RoPE cache and the non-torch change also move the earlier rows. In-sample text runs: within -1.23% to +1.83% (mean absolute error 0.51%; was 0.42%): the A5000 Llama rows move from -0.5/-0.3% to -1.2/-1.0%, the rest by less than 0.3 points. The 2× A6000 runs: Llama 3.1 8B -0.22% / +0.03%, Qwen2.5-VL 7B +0.31% (graphs) / -0.51% (eager), Qwen2.5-Omni 7B +0.03%.
 
 ## What the measurements changed
 
@@ -85,7 +162,7 @@ Gemma 2 alternates full-attention and 4096-token sliding-window layers. vLLM 0.3
 ## Known gaps
 
 - Gemma 2 with CUDA graphs: the compiled peak is 0.45 GiB above the fit (+1.8% KV tokens); its non-torch memory is also about 0.15 GiB above the 0.25 GiB kvplan assumes.
-- Multimodal models: vLLM's encoder profiling is only approximated (still +1.6–2.5% KV tokens on Qwen2.5-VL 7B after the fix, see the re-runs). The largest multimodal item is derived only for Qwen2-VL-style processors.
+- Multimodal models: the encoder pass is derived for the Qwen2.5-VL / Qwen2.5-Omni vision tower only; Whisper-style audio is approximate (25% low) and other encoders (MiniCPM-o, Gemma 3, Llava, InternVL, ...) are not sized: kvplan warns. The extra 0.20 GiB of non-torch memory for multimodal models is a fitted constant.
 - Not measured: MoE models (kvplan falls back to the older estimate and says so), MLA models, quantised checkpoints, fp8 KV cache, Hopper or Blackwell GPUs, more than 2 GPUs, and `vllm serve` itself (its defaults differ only in batch size, which the 2048-token rows cover).
 - Tesla V100: vLLM 0.32's CUDA 13 wheels do not run on compute capability 7.0 ("no kernel image is available for execution on the device"), so no V100 numbers.
 - The CUDA context before vLLM's snapshot measured 0.21–0.46 GiB; kvplan keeps 0.5 GiB for the start check so that it errs towards "will not start".
