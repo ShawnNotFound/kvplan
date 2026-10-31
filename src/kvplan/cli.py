@@ -1,48 +1,59 @@
-"""Command line: `kvplan check MODEL --gpu H100-80GB`."""
+"""Command line: `kvplan check MODEL --gpu H100-80GB`.
+
+The commands are thin layers over kvplan.api: they read options (from the command line and an
+optional config file), call the API, and render the result as text, JSON, JSON Lines, CSV or
+Markdown, to the terminal or a file.
+"""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
-import math
 import os
-import re
 import sys
 
-from . import __version__
-from . import hub
-from .gpus import GPUS_MIB, GPUDetectError, gpu_total_bytes, query_nvidia_smi, select_gpus
-from .kv import kv_layout, resolve_kv_cache_dtype
-from .loader import load
-from .model import UnsupportedModel
-from .recommend import NOT_VLLM_TASKS, PRIORITIES, TASKS, recommend
-from .sources import RepoNotFoundError, SourceError, find_token, open_source
-from .vllm import DEFAULT_UTILIZATION, LARGEST_MEASURED_ENCODER_PEAK, GiB, ServeConfig, plan
-from .weights import weight_bytes_per_rank
+from . import __version__, api, config, hub, output
+from .gpus import GPUS_MIB
+from .recommender import NOT_VLLM_TASKS, PRIORITIES, TASKS
+from .sources import SourceError
+from .vllm import DEFAULT_UTILIZATION, LARGEST_MEASURED_ENCODER_PEAK, GiB
 
 
 def _gib(b) -> str:
     return f"{b / GiB:.2f} GiB"
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
     p = argparse.ArgumentParser(prog="kvplan", description="Plan vLLM deployments without the GPU.")
     p.add_argument("--version", action="version", version=f"kvplan {__version__}")
+    p.add_argument("--config", help="read default options from this TOML or JSON file (default: $KVPLAN_CONFIG, "
+                                    "or config.toml or config.json in ~/.config/kvplan, if present)")
     sub = p.add_subparsers(dest="command", required=True)
 
     def token_arg(sp):
         sp.add_argument("--token", help="Hugging Face token (default: HF_TOKEN, or the token saved by "
                                         "`kvplan login` or `huggingface-cli login`)")
 
-    def model_args(sp, json_flag=True):
-        sp.add_argument("model", help="Hugging Face repo id (owner/name), a model name to look up "
-                                      "(e.g. Qwen2.5-7B-Instruct), or a local directory or file")
+    def output_args(sp):
+        sp.add_argument("--format", choices=output.FORMATS, default=None,
+                        help="output format (default: text, or the one the --output file name ends in)")
+        sp.add_argument("--json", action="store_true", help="same as --format json")
+        sp.add_argument("-o", "--output", metavar="PATH",
+                        help="write the result to this file, or into this directory (a file named after the model)")
+        sp.add_argument("--append", action="store_true",
+                        help="with --output and csv or jsonl: add to the file instead of replacing it")
+
+    def model_args(sp, required=True):
+        sp.add_argument("model", nargs=None if required else "?",
+                        help="Hugging Face repo id (owner/name), a model name to look up "
+                             "(e.g. Qwen2.5-7B-Instruct), or a local directory or file")
         sp.add_argument("--revision", default="main")
         token_arg(sp)
         sp.add_argument("--gguf", nargs="?", const="", default=None, metavar="QUANT",
                         help="read a GGUF file instead of safetensors (optionally pick a quant, e.g. Q4_K_M)")
-        if json_flag:
-            sp.add_argument("--json", action="store_true", help="print JSON")
+        sp.add_argument("--no-input", action="store_true", help="never ask questions")
 
     def gpu_args(sp):
         gpu = sp.add_mutually_exclusive_group()
@@ -56,10 +67,11 @@ def _parser() -> argparse.ArgumentParser:
                              "reports with --gpu auto)")
 
     c = sub.add_parser("check", help="will this vLLM config start, and how much KV cache will it get?")
-    model_args(c)
+    model_args(c, required=False)
+    c.add_argument("--models", metavar="FILE",
+                   help="check many models: a text file (one per line), a CSV with a 'model' column and optional "
+                        "option columns (gpu, tp, max_model_len, ...), or a JSON list; '-' reads standard input")
     gpu_args(c)
-    c.add_argument("--download", action="store_true",
-                   help="download the model when the check says vLLM should start")
     c.add_argument("-tp", "--tensor-parallel-size", type=int, default=1)
     c.add_argument("--max-model-len", type=int)
     c.add_argument("--max-num-seqs", type=int)
@@ -76,20 +88,24 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--skip-mm-profiling", action="store_true", help="as vLLM's --skip-mm-profiling")
     c.add_argument("--overhead-gib", type=float,
                    help="replace the estimated activation + CUDA-graph + runtime overhead with this value")
+    c.add_argument("--download", action="store_true",
+                   help="download the model when the check says vLLM should start")
+    output_args(c)
 
     i = sub.add_parser("inspect", help="show the model's attention geometry, weights and KV bytes per token")
     model_args(i)
     i.add_argument("-tp", "--tensor-parallel-size", type=int, default=1)
     i.add_argument("--kv-cache-dtype", default="auto", choices=["auto", "fp8", "fp8_e4m3", "fp8_e5m2"])
+    output_args(i)
 
     s = sub.add_parser("search", help="find models on Hugging Face by a loose name, e.g. 'llama 3.1 8b'")
     s.add_argument("query", nargs="+")
     s.add_argument("--limit", type=int, default=10)
     token_arg(s)
-    s.add_argument("--json", action="store_true", help="print JSON")
+    output_args(s)
 
     d = sub.add_parser("download", help="download a model's weights, configs and tokenizer for vLLM")
-    model_args(d, json_flag=False)
+    model_args(d)
     d.add_argument("--local-dir", help="download into this directory instead of the Hugging Face cache")
 
     lg = sub.add_parser("login", help="save a Hugging Face token so kvplan (and vLLM) can read gated models")
@@ -109,108 +125,19 @@ def _parser() -> argparse.ArgumentParser:
     r.add_argument("--no-gated", action="store_true", help="leave out gated models even with a token")
     r.add_argument("--no-input", action="store_true", help="never ask questions; use the defaults")
     token_arg(r)
-    r.add_argument("--json", action="store_true", help="print JSON")
-    return p
+    output_args(r)
+    return p, {"check": c, "inspect": i, "search": s, "download": d, "login": lg, "recommend": r}
 
 
-def _print_spec(loaded, tp: int, kv_dtype: str) -> None:
-    s = loaded.spec
-    kinds = {k: s.layer_types.count(k) for k in dict.fromkeys(s.layer_types)}
-    attn = "MLA (latent KV)" if s.is_mla else (
-        f"{s.num_heads} heads, {s.num_kv_heads} KV heads, head_dim {s.head_dim}")
-    print(f"  architecture   {s.model_type} (read from {s.source})")
-    print(f"  layers         {s.num_layers}: " + ", ".join(f"{n} {k}" for k, n in kinds.items())
-          + (f" (window {s.sliding_window})" if s.sliding_window else ""))
-    print(f"  attention      {attn}")
-    if s.num_experts:
-        print(f"  experts        {s.num_experts} (all resident in GPU memory)")
-    ctx = s.max_position_embeddings
-    if ctx and s.default_max_model_len and s.default_max_model_len != ctx:
-        print(f"  context        up to {ctx} (vLLM defaults to {s.default_max_model_len})")
-    else:
-        print(f"  context        {ctx or 'unknown'}")
-    layout = kv_layout(s, tp, kv_dtype)
-    per_token = sum(layer.page_bytes for layer in layout.layers) // layout.block_size
-    print(f"  KV per token   {per_token:,} bytes per GPU at tp={tp} ({resolve_kv_cache_dtype(s, kv_dtype)})")
+# --- helpers ---------------------------------------------------------------------------------------
 
-
-def _inspect(args, loaded) -> int:
-    w = weight_bytes_per_rank(loaded.spec, loaded.tensors, args.tensor_parallel_size)
-    if args.json:
-        from dataclasses import asdict
-        print(json.dumps({"spec": asdict(loaded.spec), "weights": asdict(w), "files": loaded.files}, indent=2))
-        return 0
-    print(args.model)
-    _print_spec(loaded, args.tensor_parallel_size, args.kv_cache_dtype)
-    print(f"  weights        {_gib(w.per_rank_bytes)} per GPU at tp={args.tensor_parallel_size} "
-          f"(checkpoint {_gib(w.total_checkpoint_bytes)} in {len(loaded.files)} file(s))")
-    for n in loaded.spec.notes + w.notes:
-        print(f"  note           {n}")
-    return 0
-
-
-def _mm_limits(value) -> dict[str, int]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError('--limit-mm-per-prompt must be a JSON object such as \'{"image": 1, "video": 0}\'')
-    # vLLM also accepts {"image": {"count": 1, ...}}.
-    return {k: int(v["count"] if isinstance(v, dict) else v) for k, v in value.items()}
-
-
-def spec_kind(spec) -> str:
-    return spec.encoder.kind if spec.encoder else ""
-
-
-def _parse_indices(text: str | None) -> list[int] | None:
-    if text is None:
-        return None
-    try:
-        indices = [int(x) for x in text.split(",") if x.strip()]
-    except ValueError:
-        raise ValueError(f"--gpu-index must be comma-separated GPU numbers such as 0 or 0,1, "
-                         f"not '{text}'") from None
-    if not indices or any(i < 0 for i in indices) or len(set(indices)) != len(indices):
-        raise ValueError(f"--gpu-index must list distinct GPU numbers such as 0 or 0,1, not '{text}'")
-    return indices
-
-
-def _resolve_gpu(args) -> tuple[int, str, int, str, list]:
-    """(total bytes, GPU name, bytes used by other processes, description, detected GPUs)."""
-    for flag, v in (("--gpu-mem-gib", args.gpu_mem_gib), ("--other-gpu-mem-gib", args.other_gpu_mem_gib),
-                    ("--overhead-gib", args.overhead_gib)):
-        if v is not None and not math.isfinite(v):
-            raise ValueError(f"{flag} must be a number of GiB, not {v}")
-    other = int(args.other_gpu_mem_gib * GiB) if args.other_gpu_mem_gib is not None else 0
-    if args.gpu_index is not None and (args.gpu_mem_gib is not None or (args.gpu or "auto").lower() != "auto"):
-        raise ValueError("--gpu-index only applies to --gpu auto")
-    if args.gpu_mem_gib is not None:
-        return int(args.gpu_mem_gib * GiB), "", other, f"{args.gpu_mem_gib} GiB GPU", []
-    if args.gpu and args.gpu.lower() != "auto":
-        return gpu_total_bytes(args.gpu), args.gpu, other, args.gpu, []
-    chosen = select_gpus(_detect(args.gpu is None), args.tensor_parallel_size, _parse_indices(args.gpu_index))
-    # vLLM sizes every rank like the smallest GPU; the busiest GPU decides whether it starts.
-    total = min(g.cuda_total_mib for g in chosen) * 2**20
-    if args.other_gpu_mem_gib is None:
-        other = max(g.used_mib or 0 for g in chosen) * 2**20
-    names = sorted({g.name for g in chosen})
-    return total, names[0] if len(names) == 1 else "", other, " / ".join(names), chosen
-
-
-def _detect(defaulted: bool):
-    try:
-        return query_nvidia_smi()
-    except GPUDetectError as e:
-        if defaulted:
-            reason = str(e).split("; pass --gpu", 1)[0]
-            raise GPUDetectError(f"no --gpu given, and this machine's GPUs could not be read ({reason}). Name the "
-                                 "GPU you will run on, e.g. --gpu A6000, or give its memory with --gpu-mem-gib")\
-                from None
-        raise
+def _fmt(args) -> str:
+    return output.choose_format(getattr(args, "format", None), getattr(args, "json", False),
+                                getattr(args, "output", None))
 
 
 def _interactive(args) -> bool:
-    return not getattr(args, "json", False) and not getattr(args, "no_input", False) \
+    return _fmt(args) == "text" and not getattr(args, "output", None) and not getattr(args, "no_input", False) \
         and sys.stdin.isatty() and sys.stdout.isatty()
 
 
@@ -238,108 +165,86 @@ def _format_matches(matches) -> str:
     return "\n".join(lines)
 
 
-def _resolve_model(args) -> str:
-    """The repo id to read: the argument itself, or for a bare name ('Qwen2.5-7B-Instruct') the most
-    downloaded repo with exactly that name."""
-    model = args.model
-    if os.path.exists(model) or re.fullmatch(r"[\w.\-]+/[\w.\-]+", model):
-        return model
-    found, matches = hub.resolve_name(model, args.token)
-    if found:
-        print(f"kvplan: using {found}, the most downloaded repo named '{model}'", file=sys.stderr)
-        return found
-    return _pick_suggestion(args, f"no Hugging Face repo named '{model}'", matches)
-
-
-def _pick_suggestion(args, problem: str, matches) -> str:
-    if not matches:
-        raise SourceError(f"{problem}, and a search found nothing similar; try `kvplan search` with fewer words")
-    if not _interactive(args):
-        raise SourceError(f"{problem}. Did you mean:\n{_format_matches(matches)}")
-    print(f"{problem}. Similar models:")
-    print(_format_matches(matches))
-    answer = _ask("Pick a number to use it (Enter to stop)")
-    if answer.isdigit() and 1 <= int(answer) <= len(matches):
-        return matches[int(answer) - 1].id
-    raise SourceError(problem)
-
-
-def _load(args):
-    """Load the model, offering similar names when the repo does not exist."""
+def _with_suggestions(args, call):
+    """Run call(model). When the model is not found, list similar ones, and in a terminal let the
+    user pick one and try again."""
     while True:
         try:
-            return load(open_source(args.model, args.revision, args.token), gguf=args.gguf)
-        except RepoNotFoundError as e:
-            matches = hub.similar_models(e.repo_id, limit=8, token=args.token)
-            args.model = _pick_suggestion(args, str(e), matches)
+            return call(args.model)
+        except api.ModelNotFound as e:
+            if not e.suggestions:
+                raise
+            if not _interactive(args):
+                raise SourceError(f"{e.problem}. Did you mean:\n{_format_matches(e.suggestions)}") from None
+            print(f"{e.problem}. Similar models:")
+            print(_format_matches(e.suggestions))
+            answer = _ask("Pick a number to use it (Enter to stop)")
+            if not (answer.isdigit() and 1 <= int(answer) <= len(e.suggestions)):
+                raise SourceError(e.problem) from None
+            args.model = e.suggestions[int(answer) - 1].id
 
 
-def _serve_command(args, target: str) -> str:
-    parts = ["vllm serve", target]
-    if args.tensor_parallel_size != 1:
-        parts.append(f"--tensor-parallel-size {args.tensor_parallel_size}")
-    if args.max_model_len:
-        parts.append(f"--max-model-len {args.max_model_len}")
-    if args.max_num_seqs:
-        parts.append(f"--max-num-seqs {args.max_num_seqs}")
-    if args.gpu_memory_utilization != DEFAULT_UTILIZATION:
-        parts.append(f"--gpu-memory-utilization {args.gpu_memory_utilization}")
-    if args.kv_cache_dtype != "auto":
-        parts.append(f"--kv-cache-dtype {args.kv_cache_dtype}")
-    if args.enforce_eager:
-        parts.append("--enforce-eager")
-    return " ".join(parts)
+def _has_hf_hub() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("huggingface_hub") is not None
 
 
-def cmd_check(args) -> int:
-    # Resolve the GPU first: a typo or a missing driver should fail before any network access.
-    total, gpu_name, other, gpu_desc, detected = _resolve_gpu(args)
-    args.model = _resolve_model(args)
-    loaded = _load(args)
-    cfg = ServeConfig(
-        gpu_total_bytes=total, tp=args.tensor_parallel_size, max_model_len=args.max_model_len,
-        max_num_seqs=args.max_num_seqs, max_num_batched_tokens=args.max_num_batched_tokens,
-        gpu_memory_utilization=args.gpu_memory_utilization, kv_cache_dtype=args.kv_cache_dtype,
-        block_size=args.block_size, enforce_eager=args.enforce_eager,
-        async_scheduling=not args.no_async_scheduling,
-        other_process_bytes=other,
-        overhead_bytes=int(args.overhead_gib * GiB) if args.overhead_gib is not None else None,
-        gpu_name=gpu_name,
-        mm_limits=_mm_limits(args.limit_mm_per_prompt),
-        mm_max_pixels=(args.mm_processor_kwargs or {}).get("max_pixels"),
-        mm_min_pixels=(args.mm_processor_kwargs or {}).get("min_pixels"),
-        skip_mm_profiling=args.skip_mm_profiling,
-    )
-    cfg.validate()
-    w = weight_bytes_per_rank(loaded.spec, loaded.tensors, cfg.tp)
-    p = plan(loaded.spec, w, cfg, args.model)
-    if args.json:
-        extra = {"spec_notes": loaded.spec.notes, "other_process_bytes": other}
-        if detected:
-            extra["detected_gpus"] = [g.__dict__ | {"cuda_total_mib": g.cuda_total_mib} for g in detected]
-        print(json.dumps(p.to_dict() | extra, indent=2))
-        if args.download and p.starts:
-            _download(args, loaded, log=lambda m: print(m, file=sys.stderr))
-        return _exit_code(p)
+def _emit(args, text_render, data, rows, name: str) -> None:
+    """Print or write the result in the chosen format."""
+    fmt = _fmt(args)
+    if fmt == "text":
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            text_render()
+        body = buf.getvalue()
+    else:
+        body = output.render(fmt, data, rows)
+    if getattr(args, "output", None):
+        written = output.write(args.output, body, fmt, name, append=args.append)
+        print(f"kvplan: wrote {written}", file=sys.stderr)
+    else:
+        sys.stdout.write(body if not body or body.endswith("\n") else body + "\n")
 
-    print(f"{args.model} on {cfg.tp} x {gpu_desc} "
+
+# --- check -----------------------------------------------------------------------------------------
+
+_CHECK_OPTIONS = {   # api.check keyword -> args attribute
+    "gpu": "gpu", "gpu_mem_gib": "gpu_mem_gib", "gpu_index": "gpu_index", "tp": "tensor_parallel_size",
+    "max_model_len": "max_model_len", "max_num_seqs": "max_num_seqs",
+    "max_num_batched_tokens": "max_num_batched_tokens", "gpu_memory_utilization": "gpu_memory_utilization",
+    "kv_cache_dtype": "kv_cache_dtype", "block_size": "block_size", "enforce_eager": "enforce_eager",
+    "other_gpu_mem_gib": "other_gpu_mem_gib", "limit_mm_per_prompt": "limit_mm_per_prompt",
+    "mm_processor_kwargs": "mm_processor_kwargs", "skip_mm_profiling": "skip_mm_profiling",
+    "overhead_gib": "overhead_gib", "revision": "revision", "token": "token", "gguf": "gguf",
+}
+
+
+def _check_kwargs(args) -> dict:
+    kw = {k: getattr(args, a) for k, a in _CHECK_OPTIONS.items()}
+    kw["async_scheduling"] = not args.no_async_scheduling
+    return kw
+
+
+def _print_check(r: api.CheckResult, utilization: float) -> None:
+    p, w, o, loaded = r.plan, r.weights, r.plan.overheads, r.loaded
+    print(f"{r.model} on {p.tp} x {r.gpu.description} "
           f"(max_model_len {p.max_model_len}, max_num_seqs {p.max_num_seqs}, "
-          f"gpu_memory_utilization {cfg.gpu_memory_utilization})")
+          f"gpu_memory_utilization {utilization})")
     print()
-    for g in detected:
+    for g in r.gpu.detected:
         used = "unknown" if g.used_mib is None else f"{g.used_mib:,} MiB"
         reserved = f", {g.reserved_mib:,} reserved by the driver" if g.reserved_mib else ""
         print(f"  gpu {g.index:<10} {g.name}: {g.total_mib:,} MiB total{reserved}, {used} in use (nvidia-smi)")
     print(f"  budget         {_gib(p.requested_bytes)} of {_gib(p.gpu_total_bytes)} per GPU")
     print(f"  weights        {_gib(w.per_rank_bytes)} per GPU (exact, from the weight files)")
-    o = p.overheads
     if o.user_override:
         print(f"  runtime        {_gib(o.total)} (your --overhead-gib)")
     else:
+        kind = loaded.spec.encoder.kind if loaded.spec.encoder else ""
         print(f"  runtime        {_gib(o.total)} estimated: activation peak {_gib(o.activation_bytes)}, "
               f"torch.compile {_gib(o.compile_bytes)}, CUDA graphs {_gib(o.cudagraph_bytes)}, "
               f"other {_gib(o.non_torch_bytes)}"
-              + (f", {spec_kind(loaded.spec)} encoder profiling {_gib(o.encoder_bytes)}"
+              + (f", {kind} encoder profiling {_gib(o.encoder_bytes)}"
                  + (" (approximate)" if o.encoder_approximate else "") if o.encoder_bytes else ""))
     print(f"  KV cache       {_gib(max(p.available_kv_bytes, 0))} available "
           f"({p.kv_bytes_per_token:,} bytes per token per GPU, {p.kv_cache_dtype}, block size {p.block_size})")
@@ -368,53 +273,148 @@ def cmd_check(args) -> int:
     if not o.user_override and not o.calibrated:
         print("  note           runtime overheads for this model are a rough estimate: they were calibrated on "
               "dense models only; pass --overhead-gib to override")
-    if p.starts and not os.path.exists(args.model):
-        print()
-        target = args.model
-        if args.download:
-            where = _download(args, loaded)
-            target = args.model if _has_hf_hub() else where
+
+
+def _exit_code(starts) -> int:
+    """0: vLLM should start; 1: it will not; 3: start not confirmed (2 is a kvplan error)."""
+    return {True: 0, False: 1, None: 3}[starts]
+
+
+def cmd_check(args) -> int:
+    if args.models:
+        if args.model:
+            raise ValueError("give either a MODEL or --models FILE, not both")
+        return _check_many(args)
+    if not args.model:
+        raise ValueError("check needs a MODEL, or --models FILE to check several")
+    r = _with_suggestions(args, lambda m: api.check(m, **_check_kwargs(args)))
+    for n in r.notes:
+        print(f"kvplan: {n}", file=sys.stderr)
+    local = os.path.exists(r.model)
+
+    def text():
+        _print_check(r, args.gpu_memory_utilization)
+        if r.starts and not local and not args.download:
+            print()
+            print(f"  download       kvplan download {r.model}   (or add --download to this check)")
+            print(f"  serve          {r.serve_command}")
+
+    _emit(args, text, r.to_dict(), [r.row()], r.model)
+    if args.download and r.starts and not local:
+        to_stdout = _fmt(args) == "text" and not args.output
+        log = print if to_stdout else (lambda m: print(m, file=sys.stderr))
+        if to_stdout:
+            print()
+        where = hub.download(r.model, r.loaded.files, r.loaded.repo_files, revision=args.revision,
+                             token=args.token, log=log)
+        log(f"  downloaded     {r.model} to {where}")
+        target = r.model if _has_hf_hub() else where
+        log(f"  serve          {r.serve_command.replace(r.model, target, 1)}")
+    return _exit_code(r.starts)
+
+
+_SEVERITY = {0: 0, 3: 1, 1: 2, 2: 3}   # exit code -> how bad, for the batch exit code
+
+
+def _check_many(args) -> int:
+    entries = config.read_model_list(args.models)
+    base = _check_kwargs(args)
+    show_progress = sys.stderr.isatty() and _fmt(args) == "text"
+    results, rows, worst = [], [], 0
+    for n, entry in enumerate(entries, 1):
+        if show_progress:
+            print(f"\r\033[K  checking {n}/{len(entries)}: {entry['model']}", end="", file=sys.stderr, flush=True)
+        try:
+            r = api.check(entry["model"], **(base | {k: v for k, v in entry.items() if k != "model"}))
+            results.append(r.to_dict())
+            rows.append(r.row())
+            code = _exit_code(r.starts)
+        except api.KvplanError as e:
+            message = str(e).splitlines()[0]
+            results.append({"model": entry["model"], "error": str(e)})
+            rows.append({"model": entry["model"], "verdict": "error", "problems": message})
+            code = 2
+        worst = max(worst, _SEVERITY[code])
+    if show_progress:
+        print("\r\033[K", end="", file=sys.stderr)
+
+    def text():
+        print(output.table(rows, ["model", "gpu", "tp", "max_model_len", "verdict", "weights_gib", "kv_tokens",
+                                  "max_concurrency", "problems"]))
+
+    _emit(args, text, results, rows, "kvplan-check")
+    return {v: k for k, v in _SEVERITY.items()}[worst]
+
+
+# --- inspect, download, search, login ---------------------------------------------------------------
+
+def cmd_inspect(args) -> int:
+    d = _with_suggestions(args, lambda m: api.inspect(m, tp=args.tensor_parallel_size,
+                                                      kv_cache_dtype=args.kv_cache_dtype, revision=args.revision,
+                                                      token=args.token, gguf=args.gguf))
+    for n in d["notes"]:
+        print(f"kvplan: {n}", file=sys.stderr)
+    s, w, tp = d["spec"], d["weights"], d["tp"]
+
+    def text():
+        kinds = {k: s["layer_types"].count(k) for k in dict.fromkeys(s["layer_types"])}
+        attn = "MLA (latent KV)" if s["kv_lora_rank"] is not None else (
+            f"{s['num_heads']} heads, {s['num_kv_heads']} KV heads, head_dim {s['head_dim']}")
+        print(d["model"])
+        print(f"  architecture   {s['model_type']} (read from {s['source']})")
+        print(f"  layers         {s['num_layers']}: " + ", ".join(f"{n} {k}" for k, n in kinds.items())
+              + (f" (window {s['sliding_window']})" if s["sliding_window"] else ""))
+        print(f"  attention      {attn}")
+        if s["num_experts"]:
+            print(f"  experts        {s['num_experts']} (all resident in GPU memory)")
+        ctx, default = s["max_position_embeddings"], s["default_max_model_len"]
+        if ctx and default and default != ctx:
+            print(f"  context        up to {ctx} (vLLM defaults to {default})")
         else:
-            print(f"  download       kvplan download {args.model}   (or add --download to this check)")
-        print(f"  serve          {_serve_command(args, target)}")
-    return _exit_code(p)
+            print(f"  context        {ctx or 'unknown'}")
+        print(f"  KV per token   {d['kv_bytes_per_token']:,} bytes per GPU at tp={tp} ({d['kv_cache_dtype']})")
+        print(f"  weights        {_gib(w['per_rank_bytes'])} per GPU at tp={tp} "
+              f"(checkpoint {_gib(w['total_checkpoint_bytes'])} in {len(d['files'])} file(s))")
+        for n in s["notes"] + w["notes"]:
+            print(f"  note           {n}")
+
+    row = {"model": d["model"], "architecture": s["model_type"], "layers": s["num_layers"],
+           "heads": s["num_heads"], "kv_heads": s["num_kv_heads"], "head_dim": s["head_dim"],
+           "experts": s["num_experts"], "context": s["max_position_embeddings"], "tp": tp,
+           "kv_bytes_per_token": d["kv_bytes_per_token"], "weights_gib": round(w["per_rank_bytes"] / GiB, 2)}
+    _emit(args, text, d, [row], d["model"])
+    return 0
 
 
-def _has_hf_hub() -> bool:
-    import importlib.util
-    return importlib.util.find_spec("huggingface_hub") is not None
+def cmd_download(args) -> int:
+    def call(model):
+        resolved, note = api.resolve_model(model, args.token)
+        if note:
+            print(f"kvplan: {note}", file=sys.stderr)
+        args.model = resolved
+        return api.download(resolved, local_dir=args.local_dir, revision=args.revision, token=args.token,
+                            gguf=args.gguf, log=print)
 
-
-def _download(args, loaded, log=print) -> str:
-    if os.path.exists(args.model):
-        raise ValueError(f"{args.model} is already on this machine")
-    where = hub.download(args.model, loaded.files, loaded.repo_files, revision=args.revision, token=args.token,
-                         local_dir=getattr(args, "local_dir", None), log=log)
-    log(f"  downloaded     {args.model} to {where}")
-    return where
-
-
-def cmd_inspect_or_download(args) -> int:
-    args.model = _resolve_model(args)
-    loaded = _load(args)
-    if args.command == "download":
-        where = _download(args, loaded)
-        print(f"serve it with: vllm serve {where if args.local_dir or not _has_hf_hub() else args.model}")
-        return 0
-    return _inspect(args, loaded)
+    where = _with_suggestions(args, call)
+    print(f"  downloaded     {args.model} to {where}")
+    print(f"serve it with: vllm serve {where if args.local_dir or not _has_hf_hub() else args.model}")
+    return 0
 
 
 def cmd_search(args) -> int:
     query = " ".join(args.query)
-    matches = hub.search_models(query, limit=args.limit, token=args.token)
-    if args.json:
-        print(json.dumps([m.__dict__ for m in matches], indent=2))
-        return 0
-    if not matches:
+    found = api.search(query, limit=args.limit, token=args.token)
+    if not found:
         print(f"nothing on Hugging Face matches '{query}'; try fewer or shorter words", file=sys.stderr)
         return 1
-    print(_format_matches(matches))
-    print(f"\nnext: kvplan check {matches[0].id}")
+
+    def text():
+        print(_format_matches([hub.HubModel(id=m["model"], downloads=m["downloads"], gated=m["gated"],
+                                            parameters={"BF16": m["parameters"]} if m["parameters"] else {})
+                               for m in found]))
+        print(f"\nnext: kvplan check {found[0]['model']}")
+
+    _emit(args, text, found, found, "kvplan-search")
     return 0
 
 
@@ -436,44 +436,7 @@ def cmd_login(args) -> int:
     return 0
 
 
-def _gpu_setup(args, ask: bool):
-    """(total bytes, name, other bytes, description, GPUs available or None, flags for `kvplan check`)."""
-    other = int(args.other_gpu_mem_gib * GiB) if args.other_gpu_mem_gib is not None else 0
-    if args.gpu_mem_gib is not None:
-        return int(args.gpu_mem_gib * GiB), "", other, f"{args.gpu_mem_gib} GiB GPU", None, \
-            ["--gpu-mem-gib", str(args.gpu_mem_gib)]
-    if args.gpu and args.gpu.lower() != "auto":
-        return gpu_total_bytes(args.gpu), args.gpu, other, args.gpu, None, ["--gpu", args.gpu]
-    gpus = _detect(args.gpu is None)
-    indices = _parse_indices(args.gpu_index)
-    if indices is not None:
-        gpus = select_gpus(gpus, len(indices), indices)
-    total = min(g.cuda_total_mib for g in gpus if g.cuda_total_mib) * 2**20
-    if args.other_gpu_mem_gib is None:
-        other = max(g.used_mib or 0 for g in gpus) * 2**20
-    names = sorted({g.name for g in gpus})
-    flags = ["--gpu", "auto"] + (["--gpu-index", args.gpu_index] if args.gpu_index else [])
-    return total, names[0] if len(names) == 1 else "", other, " / ".join(names), len(gpus), flags
-
-
-def _tp_options(args, available: int | None, gpu_desc: str, ask: bool) -> list[int]:
-    choice = args.gpus
-    if choice is None and ask:
-        if available and available > 1:
-            choice = _ask(f"This machine has {available} x {gpu_desc}. Use 1 GPU, {available}, or 'any' "
-                          "(the fewest that work)", "any")
-        elif not available:
-            choice = _ask(f"How many {gpu_desc} GPUs will you use", "1")
-    choice = (choice or "1").strip().lower()
-    limit = available or 8
-    if choice == "any":
-        return [n for n in (1, 2, 4, 8) if n <= limit]
-    if not choice.isdigit() or int(choice) < 1:
-        raise ValueError(f"--gpus must be a number of GPUs or 'any', not '{choice}'")
-    if available and int(choice) > available:
-        raise ValueError(f"--gpus {choice}, but this machine has {available} GPU(s)")
-    return [int(choice)]
-
+# --- recommend -------------------------------------------------------------------------------------
 
 def _choose(args, attr: str, question: str, options: dict, default: str, ask: bool) -> str:
     value = getattr(args, attr)
@@ -481,8 +444,7 @@ def _choose(args, attr: str, question: str, options: dict, default: str, ask: bo
         print(question)
         keys = list(options)
         for i, k in enumerate(keys, 1):
-            desc = options[k] if isinstance(options[k], str) else options[k][1]
-            print(f"  {i}. {k:<17} {desc}")
+            print(f"  {i}. {k:<17} {options[k]}")
         answer = _ask("Choose", default)
         value = keys[int(answer) - 1] if answer.isdigit() and 1 <= int(answer) <= len(keys) else answer
     value = value or default
@@ -493,81 +455,76 @@ def _choose(args, attr: str, question: str, options: dict, default: str, ask: bo
 
 def cmd_recommend(args) -> int:
     ask = _interactive(args)
-    total, gpu_name, other, gpu_desc, available, gpu_flags = _gpu_setup(args, ask)
-    tp_options = _tp_options(args, available, gpu_desc, ask)
+    gpus = args.gpus
+    if gpus is None and ask:
+        g = api.resolve_gpu(args.gpu, args.gpu_mem_gib, args.gpu_index, None, args.other_gpu_mem_gib)
+        if len(g.detected) > 1:
+            gpus = _ask(f"This machine has {len(g.detected)} x {g.description}. Use 1 GPU, {len(g.detected)}, "
+                        "or 'any' (the fewest that work)", "any")
+        elif not g.detected:
+            gpus = _ask(f"How many {g.description} GPUs will you use", "1")
     tasks = {k: v[1] for k, v in TASKS.items()} | {k: "(not served by vLLM)" for k in NOT_VLLM_TASKS}
     task = _choose(args, "task", "What will the model do?", tasks, "chat", ask)
     if task in NOT_VLLM_TASKS:
-        print(f"kvplan: {NOT_VLLM_TASKS[task]}", file=sys.stderr)
-        return 2
+        raise ValueError(NOT_VLLM_TASKS[task])
     priority = _choose(args, "priority", "What matters more?", PRIORITIES, "balanced", ask)
     length = args.max_model_len
     if length is None and ask:
         answer = _ask("Context length per request, in tokens", "8192")
         length = int(answer) if answer.isdigit() else None
-    length = length or 8192
-    token = args.token or find_token()
-
-    def cfg_for_tp(tp):
-        return ServeConfig(gpu_total_bytes=total, tp=tp, gpu_memory_utilization=args.gpu_memory_utilization,
-                           other_process_bytes=other, gpu_name=gpu_name)
+    show_progress = sys.stderr.isatty() and _fmt(args) == "text"
 
     def progress(i, model_id):
-        if sys.stderr.isatty() and not args.json:
+        if show_progress:
             print(f"\r\033[K  checking {i}: {model_id}", end="", file=sys.stderr, flush=True)
 
-    res = recommend(task, priority, cfg_for_tp, tp_options, max_model_len=length,
-                    min_concurrency=args.min_concurrency, limit=args.limit, token=token,
-                    include_gated=bool(token) and not args.no_gated, progress=progress)
-    if sys.stderr.isatty() and not args.json:
+    res = api.recommend(task=task, priority=priority, gpu=args.gpu, gpu_mem_gib=args.gpu_mem_gib,
+                        gpu_index=args.gpu_index, gpus=gpus or "1", max_model_len=length or 8192,
+                        min_concurrency=args.min_concurrency, gpu_memory_utilization=args.gpu_memory_utilization,
+                        other_gpu_mem_gib=args.other_gpu_mem_gib, limit=args.limit,
+                        include_gated=not args.no_gated, token=args.token, progress=progress)
+    if show_progress:
         print("\r\033[K", end="", file=sys.stderr)
-    if args.json:
-        print(json.dumps({"task": task, "priority": priority, "max_model_len": length, "gpu": gpu_desc,
-                          "tp_options": tp_options, "checked": res.checked, "considered": res.considered,
-                          "left_out": res.skipped,
-                          "recommendations": [{"model": r.model.id, "parameters": r.model.total_parameters,
-                                               "downloads": r.model.downloads, "tp": r.tp,
-                                               "weights_bytes_per_gpu": r.weights_bytes, "kv_tokens": r.kv_tokens,
-                                               "max_concurrency": r.max_concurrency,
-                                               "max_model_len": r.max_model_len, "warnings": r.notes}
-                                              for r in res.recommendations]}, indent=2))
-        return 0 if res.recommendations else 1
-    recs = res.recommendations
-    gpus = "/".join(str(t) for t in tp_options)
-    print(f"\n{task} models for {gpus} x {gpu_desc}, {priority} ({PRIORITIES[priority]}), "
-          f"{length:,}-token context\n")
-    if not recs:
-        print("  none of the checked models should start with these settings; try a shorter context, more GPUs "
-              "or --priority speed")
-    else:
-        print(f"  {'#':>2}  {'model':<52} {'size':>6} {'GPUs':>4} {'weights/GPU':>11} {'KV tokens':>11} "
-              f"{'requests at once':>16}")
-        for i, r in enumerate(recs, 1):
-            print(f"  {i:>2}  {r.model.id:<52} {_fmt_count(r.model.total_parameters):>6} {r.tp:>4} "
-                  f"{_gib(r.weights_bytes):>11} {r.kv_tokens:>11,} {r.max_concurrency:>15.1f}x"
-                  + ("  (gated)" if r.model.gated else ""))
-            for n in r.notes:
-                print(f"      {n}")
-    print(f"\n  Checked {res.checked} of {res.considered} candidates from Hugging Face's most downloaded "
-          f"{TASKS[task][0]} models. Ranked by size and downloads, not by benchmark scores.")
-    if res.skipped:
-        print("  Left out: " + ", ".join(f"{n} {why}" for why, n in res.skipped.items()))
-    if not token:
-        print("  Gated models (Llama, Gemma, ...) need a token: run `kvplan login`.")
-    if not recs:
-        return 1
+    recs = res["recommendations"]
 
     def check_argv(r):
-        return ["check", r.model.id, "--max-model-len", str(r.max_model_len), "-tp", str(r.tp)] + gpu_flags
+        return ["check", r["model"], "--max-model-len", str(r["max_model_len"]), "-tp", str(r["tp"])] \
+            + res["gpu_flags"]
 
-    if not ask:
-        print(f"\n  Details: kvplan {' '.join(check_argv(recs[0]))}")
-        print(f"  Download: kvplan download {recs[0].model.id}")
-        return 0
-    while True:
+    def text():
+        sizes = "/".join(str(t) for t in res["tp_options"])
+        print(f"\n{task} models for {sizes} x {res['gpu']}, {priority} ({PRIORITIES[priority]}), "
+              f"{res['max_model_len']:,}-token context\n")
+        if not recs:
+            print("  none of the checked models should start with these settings; try a shorter context, more "
+                  "GPUs or --priority speed")
+        else:
+            print(f"  {'#':>2}  {'model':<52} {'size':>6} {'GPUs':>4} {'weights/GPU':>11} {'KV tokens':>11} "
+                  f"{'requests at once':>16}")
+            for n, r in enumerate(recs, 1):
+                print(f"  {n:>2}  {r['model']:<52} {_fmt_count(r['parameters']):>6} {r['tp']:>4} "
+                      f"{r['weights_gib']:>7.2f} GiB {r['kv_tokens']:>11,} {r['max_concurrency']:>15.1f}x"
+                      + ("  (gated)" if r["gated"] else ""))
+                for w in r["warnings"]:
+                    print(f"      {w}")
+        print(f"\n  Checked {res['checked']} of {res['considered']} candidates from Hugging Face's most downloaded "
+              f"{res['pipeline_tag']} models. Ranked by size and downloads, not by benchmark scores.")
+        if res["left_out"]:
+            print("  Left out: " + ", ".join(f"{n} {why}" for why, n in res["left_out"].items()))
+        if not res["has_token"]:
+            print("  Gated models (Llama, Gemma, ...) need a token: run `kvplan login`.")
+        if recs and not ask:
+            print(f"\n  Details: kvplan {' '.join(check_argv(recs[0]))}")
+            print(f"  Download: kvplan download {recs[0]['model']}")
+
+    rows = [{k: v for k, v in r.items() if k != "warnings"} | {"warnings": "; ".join(r["warnings"])} for r in recs]
+    _emit(args, text, res, rows, "kvplan-recommend")
+    if not recs:
+        return 1
+    while ask:
         answer = _ask("\nNumber for full details, d<number> to download, Enter to finish").lower()
         if not answer:
-            return 0
+            break
         download = answer.startswith("d")
         num = answer[1:].strip() if download else answer
         if not num.isdigit() or not 1 <= int(num) <= len(recs):
@@ -575,24 +532,28 @@ def cmd_recommend(args) -> int:
             continue
         r = recs[int(num) - 1]
         print()
-        main(["download", r.model.id] if download else check_argv(r))
+        main(["download", r["model"]] if download else check_argv(r))
+    return 0
 
 
-def _exit_code(p) -> int:
-    """0: vLLM should start; 1: it will not; 3: start not confirmed (2 is a kvplan error)."""
-    return {True: 0, False: 1, None: 3}[p.starts]
-
+# --- entry point -----------------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    parser, subparsers = _parser()
+    args = parser.parse_args(argv)
     try:
-        commands = {"inspect": cmd_inspect_or_download, "download": cmd_inspect_or_download, "check": cmd_check,
-                    "search": cmd_search, "login": cmd_login, "recommend": cmd_recommend}
+        settings = config.load_config(args.config)
+        if settings:
+            config.apply(subparsers[args.command], args.command, settings)
+            args = parser.parse_args(argv)
+        commands = {"check": cmd_check, "inspect": cmd_inspect, "download": cmd_download, "search": cmd_search,
+                    "login": cmd_login, "recommend": cmd_recommend}
         return commands[args.command](args)
     except KeyboardInterrupt:
         print(file=sys.stderr)
         return 130
-    except (SourceError, UnsupportedModel, ValueError) as e:
+    except api.KvplanError as e:
         print(f"kvplan: {e}", file=sys.stderr)
         return 2
 

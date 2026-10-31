@@ -4,7 +4,7 @@ import subprocess
 import pytest
 
 from helpers import llama_like_tensors, write_model_dir
-from kvplan import cli
+from kvplan import api, cli
 from kvplan.gpus import (GPUS_MIB, RESERVED_MIB, GPUDetectError, DetectedGPU, compute_capability, gpu_total_bytes,
                          parse_nvidia_smi,
                          query_nvidia_smi, select_gpus)
@@ -105,7 +105,7 @@ def model_dir(tmp_path):
 
 
 def use_smi(monkeypatch, text):
-    monkeypatch.setattr(cli, "query_nvidia_smi", lambda: parse_nvidia_smi(text))
+    monkeypatch.setattr(api, "query_nvidia_smi", lambda: parse_nvidia_smi(text))
 
 
 def test_auto_counts_memory_other_processes_hold(monkeypatch, capsys, model_dir):
@@ -153,7 +153,7 @@ def test_bad_gpu_arguments_fail_cleanly(monkeypatch, capsys, model_dir, argv, ms
 def test_auto_without_driver_fails_cleanly(monkeypatch, capsys, model_dir):
     def missing():
         raise GPUDetectError("--gpu auto needs nvidia-smi, which is not on PATH; pass --gpu NAME or --gpu-mem-gib")
-    monkeypatch.setattr(cli, "query_nvidia_smi", missing)
+    monkeypatch.setattr(api, "query_nvidia_smi", missing)
     assert cli.main(["check", model_dir, "--gpu", "auto"]) == 2
     assert "nvidia-smi" in capsys.readouterr().err
 

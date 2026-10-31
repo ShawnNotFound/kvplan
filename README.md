@@ -123,6 +123,54 @@ Gated models (Llama, Gemma and others) need a Hugging Face token, and you need t
 
 `--token` on any command overrides both. With a token, `recommend` also considers gated models.
 
+## Use it from scripts and apps
+
+**Output.** Every command that prints results takes `--format text|json|jsonl|csv|markdown` (`--json` is short for `--format json`) and `-o/--output PATH`. The format follows the file name when you don't give one (`-o results.csv` writes CSV). A path ending in `/`, or an existing directory, gets one file per model. With `--append`, CSV and JSON Lines output is added to the file, so repeated runs build a log. JSON holds everything kvplan computed; the other formats hold one flat row per model (model, GPU, tp, context, verdict, weights, KV cache, KV tokens, concurrency, problems, `vllm serve` command).
+
+**Many models at once.** `kvplan check --models FILE` checks every model in a file and prints one table, or writes one CSV, JSON or Markdown file. The file is a text file with one model per line, a CSV with a `model` column plus any option columns (`gpu`, `tp`, `max_model_len`, `kv_cache_dtype`, ...), or a JSON list of names or objects; `-` reads standard input. A model that cannot be read gets an `error` row instead of stopping the run. The exit code is the worst result: 0 all start, 3 some not confirmed, 1 some will not start, 2 some could not be checked.
+
+```
+$ kvplan check --models models.csv -o results/ --format csv
+kvplan: wrote results/kvplan-check.csv
+```
+
+**Config file.** Put defaults in `~/.config/kvplan/config.toml` (or `config.json`, or any file named by `KVPLAN_CONFIG` or `--config`). Top-level keys apply to every command; a table named after a command applies to that command only. Options on the command line still win.
+
+```toml
+gpu = "A6000"
+format = "csv"
+output = "results/"
+
+[check]
+max_model_len = 8192
+tp = 2
+
+[recommend]
+task = "code"
+priority = "speed"
+```
+
+TOML needs Python 3.11 or newer; JSON works everywhere.
+
+**Python.** The command line is a thin layer over `kvplan`'s Python API, which returns plain data and never prints or asks:
+
+```python
+import kvplan
+
+r = kvplan.check("Qwen/Qwen2.5-7B-Instruct", gpu="A6000", max_model_len=8192)
+r.starts            # True, False, or None for "start not confirmed"
+r.kv_tokens         # KV-cache capacity in tokens
+r.to_dict()         # everything, as JSON-ready data (the same as --format json)
+r.serve_command     # "vllm serve Qwen/Qwen2.5-7B-Instruct --max-model-len 8192"
+
+kvplan.inspect("openai/gpt-oss-20b")["kv_bytes_per_token"]
+kvplan.search("llama 3.1 8b instruct", limit=5)
+kvplan.recommend(task="chat", priority="quality", gpu="A6000", gpus="any")["recommendations"]
+kvplan.download("Qwen/Qwen2.5-7B-Instruct")      # returns where the files went
+```
+
+Without `gpu` or `gpu_mem_gib`, `check` plans for the GPUs on the machine it runs on. Errors are `kvplan.KvplanError` (a tuple to catch); an unknown model raises `kvplan.ModelNotFound`, whose `suggestions` lists the closest popular models.
+
 ## What it covers
 
 | | |

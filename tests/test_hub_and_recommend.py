@@ -5,7 +5,7 @@ import urllib.error
 
 import pytest
 
-from kvplan import cli, hub, recommend, sources
+from kvplan import cli, hub, recommender, sources
 from kvplan.hub import HubModel
 from kvplan.model import spec_from_config
 from kvplan.vllm import GiB, ServeConfig
@@ -135,7 +135,7 @@ def fake_loader(mid):
 
 
 def test_candidates_filter_unsupported_gated_and_oversized():
-    pool, skipped = recommend.candidates("chat", token=None, include_gated=False, budget_bytes=40 * GiB,
+    pool, skipped = recommender.candidates("chat", token=None, include_gated=False, budget_bytes=40 * GiB,
                                          max_tp=1, lister=fake_list)
     ids = {x.id for x in pool}
     assert "Qwen/Qwen2.5-72B-Instruct" not in ids          # 145 GB of weights on one 40 GiB budget
@@ -147,19 +147,19 @@ def test_candidates_filter_unsupported_gated_and_oversized():
 
 
 def test_code_task_keeps_code_models():
-    pool, _ = recommend.candidates("code", token=None, include_gated=False, budget_bytes=40 * GiB, max_tp=1,
+    pool, _ = recommender.candidates("code", token=None, include_gated=False, budget_bytes=40 * GiB, max_tp=1,
                                    lister=fake_list)
     assert [x.id for x in pool] == ["Qwen/Qwen2.5-Coder-7B-Instruct"]
 
 
 def test_priority_orders_by_size():
     pool = [m("a/small", 10, 1e9), m("b/big", 10, 30e9), m("c/mid", 10, 7e9)]
-    assert [x.id for x in recommend.order_candidates(pool, "quality", 80 * GiB)] == ["b/big", "c/mid", "a/small"]
-    assert [x.id for x in recommend.order_candidates(pool, "speed", 80 * GiB)] == ["a/small", "c/mid", "b/big"]
+    assert [x.id for x in recommender.order_candidates(pool, "quality", 80 * GiB)] == ["b/big", "c/mid", "a/small"]
+    assert [x.id for x in recommender.order_candidates(pool, "speed", 80 * GiB)] == ["a/small", "c/mid", "b/big"]
 
 
 def test_recommend_uses_more_gpus_only_when_needed():
-    res = recommend.recommend("chat", "quality", cfg_for(48), [1, 2, 4], max_model_len=8192, token=None,
+    res = recommender.recommend("chat", "quality", cfg_for(48), [1, 2, 4], max_model_len=8192, token=None,
                               lister=fake_list, loader=fake_loader)
     by_id = {r.model.id: r for r in res.recommendations}
     assert by_id["Qwen/Qwen2.5-7B-Instruct"].tp == 1
@@ -170,7 +170,7 @@ def test_recommend_uses_more_gpus_only_when_needed():
 
 
 def test_recommend_drops_models_that_do_not_start():
-    res = recommend.recommend("chat", "speed", cfg_for(20), [1], max_model_len=8192, token=None,
+    res = recommender.recommend("chat", "speed", cfg_for(20), [1], max_model_len=8192, token=None,
                               lister=fake_list, loader=fake_loader)
     assert {r.model.id for r in res.recommendations} == {"Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen2.5-Coder-7B-Instruct",
                                                          "unsloth/Llama-3.1-8B-Instruct"}

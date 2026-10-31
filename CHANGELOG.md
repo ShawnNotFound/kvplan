@@ -8,6 +8,10 @@
 - A repo that does not exist was reported as "gated or private"; it is now reported as not found, with suggestions.
 - `--gpu` defaults to `auto`: without a GPU option, kvplan plans for the GPUs on this machine, and explains what to pass when it finds none.
 - `kvplan download` and `kvplan check --download`: download only the files vLLM needs, into the Hugging Face cache (with huggingface_hub) or a directory. A passing check now prints the download command and the matching `vllm serve` line.
+- Output formats and files: `--format text|json|jsonl|csv|markdown` and `-o/--output` (a file, or a directory for one file per model), with `--append` for CSV and JSON Lines logs.
+- `kvplan check --models FILE`: check a list of models (text, CSV with per-model option columns, or JSON; `-` for standard input) in one run, with one table or file for all of them.
+- Config files (`~/.config/kvplan/config.toml` or `.json`, `KVPLAN_CONFIG`, `--config`): default options for every command or per command.
+- Python API: `kvplan.check`, `inspect`, `search`, `recommend` and `download` return plain data for use in other programs; the command line is now built on it.
 - `kvplan login`: check a Hugging Face token and save it where huggingface_hub, vLLM and huggingface-cli read it. `HF_TOKEN_PATH` and `XDG_CACHE_HOME` are now respected when looking for a saved token.
 
 ## 0.1.1 (2026-10-30)

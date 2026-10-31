@@ -297,4 +297,4 @@ def test_errors_still_win_over_unconfirmed():
 
 def test_exit_codes():
     from kvplan.cli import _exit_code
-    assert [_exit_code(type("P", (), {"starts": v})) for v in (True, False, None)] == [0, 1, 3]
+    assert [_exit_code(v) for v in (True, False, None)] == [0, 1, 3]
