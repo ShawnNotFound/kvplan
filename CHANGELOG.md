@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `kvplan recommend`: popular Hugging Face models that vLLM should start on your GPUs, each one fully checked. It asks (or takes as options) how many GPUs to use, the task (chat, code, vision, audio, omni), quality or speed, and the context length; pick one to see its full check or download it.
+- `kvplan search`: find repos by a loose name such as `llama 3.1 8b instruct`.
+- Model names without an owner (`Qwen2.5-7B-Instruct`) resolve to the most downloaded repo with that exact name. A misspelled or unknown name lists the closest popular models instead of failing, and in a terminal lets you pick one.
+- A repo that does not exist was reported as "gated or private"; it is now reported as not found, with suggestions.
+- `--gpu` defaults to `auto`: without a GPU option, kvplan plans for the GPUs on this machine, and explains what to pass when it finds none.
+- `kvplan download` and `kvplan check --download`: download only the files vLLM needs, into the Hugging Face cache (with huggingface_hub) or a directory. A passing check now prints the download command and the matching `vllm serve` line.
+- `kvplan login`: check a Hugging Face token and save it where huggingface_hub, vLLM and huggingface-cli read it. `HF_TOKEN_PATH` and `XDG_CACHE_HOME` are now respected when looking for a saved token.
+
 ## 0.1.1 (2026-10-30)
 
 - The RoPE cache note is left out when it would read 0.00 GiB (small models). The cache is still counted with the weights.

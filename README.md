@@ -38,16 +38,20 @@ pip install kvplan
 
 or the latest development version: `pip install git+https://github.com/ShawnNotFound/kvplan`.
 
-No dependencies beyond Python 3.10+. For gated models (Llama, Gemma), set `HF_TOKEN` or run `huggingface-cli login`.
+No dependencies beyond Python 3.10+. For gated models (Llama, Gemma), run `kvplan login` or set `HF_TOKEN`; see [Gated models](#gated-models).
 
 ## Use
 
 ```
-kvplan check MODEL (--gpu NAME | --gpu-mem-gib GIB) [vLLM options]
+kvplan check MODEL [--gpu NAME | --gpu-mem-gib GIB] [vLLM options] [--download]
 kvplan inspect MODEL
+kvplan recommend [--gpu NAME] [--gpus N|any] [--task chat|code|vision|audio|omni] [--priority quality|balanced|speed]
+kvplan search WORDS...
+kvplan download MODEL [--local-dir DIR]
+kvplan login
 ```
 
-`MODEL` is a Hugging Face repo id or a local directory or file. `check` understands the vLLM options that change memory: `-tp/--tensor-parallel-size`, `--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--block-size`, `--enforce-eager`. Add `--json` for scripts and CI. The exit code is 0 when vLLM should start and 1 when it won't. It is 3 ("start not confirmed", `"starts": null` in the JSON) when a term kvplan cannot size could decide the outcome: an encoder whose startup profiling it cannot size, an architecture vLLM has no native implementation of, or attention geometry read from weight shapes. The output then names the unsized term, the memory left under kvplan's estimates, and what to do. Exit code 2 is a kvplan error.
+`MODEL` is a Hugging Face repo id, a local directory or file, or just a model name. For a name without an owner, such as `Qwen2.5-7B-Instruct`, kvplan uses the most downloaded repo with exactly that name and says which. If nothing matches, or a repo id is misspelled, it lists the closest popular models instead (and in a terminal, lets you pick one). Without `--gpu` or `--gpu-mem-gib`, kvplan plans for the GPUs on this machine (`--gpu auto`). `check` understands the vLLM options that change memory: `-tp/--tensor-parallel-size`, `--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--block-size`, `--enforce-eager`. Add `--json` for scripts and CI. The exit code is 0 when vLLM should start and 1 when it won't. It is 3 ("start not confirmed", `"starts": null` in the JSON) when a term kvplan cannot size could decide the outcome: an encoder whose startup profiling it cannot size, an architecture vLLM has no native implementation of, or attention geometry read from weight shapes. The output then names the unsized term, the memory left under kvplan's estimates, and what to do. Exit code 2 is a kvplan error.
 
 For the most precise result, give the GPU memory exactly as CUDA reports it (`--gpu-mem-gib`); the `--gpu` presets use the slightly larger `nvidia-smi` totals.
 
@@ -75,6 +79,49 @@ openai/gpt-oss-20b
   KV per token   49,152 bytes per GPU at tp=1 (auto)
   weights        12.82 GiB per GPU at tp=1 (checkpoint 12.82 GiB in 3 file(s))
 ```
+
+When vLLM should start, `check` ends with the command to download the model and the matching `vllm serve` line:
+
+```
+  RESULT         vLLM should start
+
+  download       kvplan download Qwen/Qwen2.5-1.5B-Instruct   (or add --download to this check)
+  serve          vllm serve Qwen/Qwen2.5-1.5B-Instruct --max-model-len 8192
+```
+
+`kvplan download` fetches the weight files kvplan sized plus the configs, tokenizer and chat template vLLM needs, and nothing else (no duplicate `.bin`, `.pth` or GGUF copies). With `huggingface_hub` installed (any machine with vLLM has it) the files go into the Hugging Face cache, so `vllm serve REPO_ID` finds them; otherwise, or with `--local-dir`, into a directory, resuming interrupted downloads.
+
+## Find a model
+
+`kvplan recommend` lists popular Hugging Face models that vLLM should start on your GPUs, each one checked the same way as `kvplan check`. In a terminal it asks what you need: how many GPUs to use (one, all, or the fewest that work), the task, quality or speed, and the context length. Pass the answers as options, or `--no-input` for the defaults, to skip the questions.
+
+```
+$ kvplan recommend --gpu A5000 --task vision --priority speed --max-model-len 4096
+
+vision models for 1 x A5000, speed (smaller models first: faster replies and more requests at once), 4,096-token context
+
+   #  model                                                  size GPUs weights/GPU   KV tokens requests at once
+   1  Qwen/Qwen2.5-VL-3B-Instruct-AWQ                        3.8B    1    3.29 GiB     441,140           107.7x
+   2  Qwen/Qwen2.5-VL-3B-Instruct                            3.8B    1    7.12 GiB     348,207            85.0x
+   3  Qwen/Qwen2.5-VL-7B-Instruct                            8.3B    1   15.57 GiB      65,440            16.0x
+
+  Checked 28 of 32 candidates from Hugging Face's most downloaded image-text-to-text models. Ranked by size and downloads, not by benchmark scores.
+  ...
+Number for full details, d<number> to download, Enter to finish:
+```
+
+Pick a number to see the full `kvplan check` output, or `d` and a number to download it. Candidates are the most downloaded models for the task on Hugging Face. kvplan leaves out models vLLM has no native implementation of, GGUF and MLX conversions, base and draft models, and anything whose weights cannot fit, then orders the rest by size: larger first for `quality`, smaller first for `speed`, about a third of the memory for `balanced`. Size and popularity are only rough signs of quality, so treat the list as a shortlist to try, not a ranking. Image generation (Stable Diffusion, FLUX) is not served by vLLM, so kvplan does not recommend those.
+
+`kvplan search llama 3.1 8b instruct` finds repos by a loose name, most downloaded first.
+
+## Gated models
+
+Gated models (Llama, Gemma and others) need a Hugging Face token, and you need to accept the model's licence on its Hugging Face page. Either:
+
+- run `kvplan login` and paste a read token from https://huggingface.co/settings/tokens. kvplan checks it and saves it where `huggingface-cli login` does (`$HF_HOME/token`, or `HF_TOKEN_PATH`), so vLLM and `huggingface-cli` use it too; or
+- set `HF_TOKEN` in your environment (for example in your shell profile). It takes precedence over a saved token.
+
+`--token` on any command overrides both. With a token, `recommend` also considers gated models.
 
 ## What it covers
 

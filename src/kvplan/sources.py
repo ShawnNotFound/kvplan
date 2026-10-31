@@ -26,13 +26,28 @@ class GatedRepoError(SourceError):
     """The repository needs an access token (gated or private)."""
 
 
+class RepoNotFoundError(SourceError):
+    """No repository with this id (or a private one the token cannot see)."""
+
+    def __init__(self, repo_id: str, message: str):
+        super().__init__(message)
+        self.repo_id = repo_id
+
+
+def token_path() -> Path:
+    """Where huggingface_hub keeps the token from `huggingface-cli login` (and `kvplan login`)."""
+    if os.environ.get("HF_TOKEN_PATH"):
+        return Path(os.environ["HF_TOKEN_PATH"]).expanduser()
+    hf_home = os.environ.get("HF_HOME") or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "huggingface"
+    return Path(hf_home).expanduser() / "token"
+
+
 def find_token() -> str | None:
     """Return a Hugging Face token from the environment or the huggingface_hub token file."""
     for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         if os.environ.get(var):
             return os.environ[var].strip()
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    token_file = hf_home / "token"
+    token_file = token_path()
     if token_file.is_file():
         token = token_file.read_text().strip()
         return token or None
@@ -124,7 +139,7 @@ class HubSource(Source):
             return _opener.open(urllib.request.Request(url, headers=headers), timeout=self.timeout)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                hint = "set HF_TOKEN or run `huggingface-cli login`" if not self.token else \
+                hint = "set HF_TOKEN or run `kvplan login`" if not self.token else \
                     "your token does not have access; accept the model's licence on its Hugging Face page"
                 raise GatedRepoError(f"{self.repo_id} is gated or private ({e.code}): {hint}") from e
             if e.code == 404:
@@ -139,9 +154,15 @@ class HubSource(Source):
 
     def list_files(self) -> list[str]:
         url = f"{self.endpoint}/api/models/{self.repo_id}/revision/{urllib.parse.quote(self.revision, safe='')}"
-        resp = self._open(url)
+        try:
+            resp = self._open(url)
+        except GatedRepoError:
+            # The model API answers for gated repos too, so 401/403 here means the repo does not exist
+            # or is private (Hugging Face does not say which without a token that can see it).
+            resp = None
         if resp is None:
-            raise SourceError(f"{self.repo_id}: repository or revision '{self.revision}' not found")
+            what = f"revision '{self.revision}'" if self.revision != "main" else "repository"
+            raise RepoNotFoundError(self.repo_id, f"{self.repo_id}: {what} not found on Hugging Face (or private)")
         with resp:
             info = json.load(resp)
         return sorted(s["rfilename"] for s in info.get("siblings", []))
