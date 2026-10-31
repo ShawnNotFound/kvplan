@@ -9,7 +9,7 @@ Use it from Python as well as from the command line:
 See kvplan.api for every function and its options.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 from .api import (CheckResult, KvplanError, ModelNotFound, check, download, inspect,  # noqa: E402
                   recommend, search)

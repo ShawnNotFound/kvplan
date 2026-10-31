@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-31)
 
 - `kvplan recommend`: popular Hugging Face models that vLLM should start on your GPUs, each one fully checked. It asks (or takes as options) how many GPUs to use, the task (chat, code, vision, audio, omni), quality or speed, and the context length; pick one to see its full check or download it.
 - `kvplan search`: find repos by a loose name such as `llama 3.1 8b instruct`.

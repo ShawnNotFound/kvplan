@@ -199,8 +199,8 @@ Not measured yet: large MoE and MLA models, the size of an fp8 KV cache, other v
 
 ## Roadmap
 
-- v0.2: calibrated runtime overheads (done for dense models, see Accuracy), a measurement script anyone can run on their GPU
-- v0.3: llama.cpp profile, published validation table
+- v0.2 (released): model search and recommendations, downloads, gated-model login, output formats and files, config files and a Python API
+- v0.3: a measurement script anyone can run on their GPU, llama.cpp profile, published validation table
 - v0.4: `place`: several models across several machines with mixed GPUs
 
 ## Licence
