@@ -130,3 +130,29 @@ def test_config_file_errors(models, tmp_path, capsys):
     assert "is not one of" in capsys.readouterr().err
     assert cli.main(["--config", str(tmp_path / "none.json"), "check", models[0]]) == 2
     assert "not found" in capsys.readouterr().err
+
+
+GREEN, RED = "\033[32;1m", "\033[31;1m"
+
+
+def test_colours_follow_the_verdict(models, capsys):
+    assert cli.main(["--color", "always", "check", models[0], "--gpu", "A5000"]) == 0
+    assert GREEN + "vLLM should start" in capsys.readouterr().out
+    assert cli.main(["--color", "always", "check", models[0], "--gpu-mem-gib", "0.01"]) == 1
+    out = capsys.readouterr().out
+    assert RED + "vLLM will not start" in out and "\033[31merror" in out
+
+
+def test_no_colour_in_pipes_files_or_data_formats(models, tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    assert cli.main(["check", models[0], "--gpu", "A5000"]) == 0          # captured output is not a terminal
+    assert "\033[" not in capsys.readouterr().out
+    assert cli.main(["--color", "always", "check", models[0], "--gpu", "A5000", "--format", "csv"]) == 0
+    assert "\033[" not in capsys.readouterr().out
+    target = tmp_path / "r.txt"
+    assert cli.main(["--color", "always", "check", models[0], "--gpu", "A5000", "-o", str(target)]) == 0
+    assert "\033[" not in target.read_text()
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    assert cli.main(["check", models[0], "--gpu", "A5000"]) == 0
+    assert "\033[" not in capsys.readouterr().out

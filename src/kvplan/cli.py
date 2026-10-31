@@ -14,7 +14,7 @@ import json
 import os
 import sys
 
-from . import __version__, api, config, hub, output
+from . import __version__, api, config, hub, output, style
 from .gpus import GPUS_MIB
 from .recommender import NOT_VLLM_TASKS, PRIORITIES, TASKS
 from .sources import SourceError
@@ -25,9 +25,19 @@ def _gib(b) -> str:
     return f"{b / GiB:.2f} GiB"
 
 
+_color = False   # whether the text being rendered goes to a terminal that shows colour
+
+
+def _c(text: str, *styles: str) -> str:
+    return style.paint(text, *styles, on=_color)
+
+
 def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
     p = argparse.ArgumentParser(prog="kvplan", description="Plan vLLM deployments without the GPU.")
     p.add_argument("--version", action="version", version=f"kvplan {__version__}")
+    p.add_argument("--color", choices=style.MODES, default=None,
+                   help="colour the text output: auto (the default: only on a terminal), always or never; "
+                        "NO_COLOR also turns it off")
     p.add_argument("--config", help="read default options from this TOML or JSON file (default: $KVPLAN_CONFIG, "
                                     "or config.toml or config.json in ~/.config/kvplan, if present)")
     sub = p.add_subparsers(dest="command", required=True)
@@ -191,11 +201,16 @@ def _has_hf_hub() -> bool:
 
 def _emit(args, text_render, data, rows, name: str) -> None:
     """Print or write the result in the chosen format."""
+    global _color
     fmt = _fmt(args)
     if fmt == "text":
+        _color = not getattr(args, "output", None) and style.enabled(sys.stdout)
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            text_render()
+        try:
+            with contextlib.redirect_stdout(buf):
+                text_render()
+        finally:
+            _color = False
         body = buf.getvalue()
     else:
         body = output.render(fmt, data, rows)
@@ -252,7 +267,7 @@ def _print_check(r: api.CheckResult, utilization: float) -> None:
         print(f"  capacity       {p.kv.kv_tokens:,} tokens; max concurrency at {p.max_model_len:,} tokens per "
               f"request: {p.kv.max_concurrency:.2f}x")
     print()
-    result = p.verdict
+    result = _c(p.verdict, style.verdict_color(p.starts), "bold")
     if p.starts is None:
         result += ": kvplan could not check " + "; ".join(p.unconfirmed)
         if p.start_margin_bytes is not None:
@@ -260,19 +275,20 @@ def _print_check(r: api.CheckResult, utilization: float) -> None:
             if any("encoder" in u for u in p.unconfirmed):
                 result += (f"; the largest encoder startup peak measured so far was "
                            f"{_gib(LARGEST_MEASURED_ENCODER_PEAK)}")
-    print("  RESULT         " + result)
+    print("  " + _c("RESULT", "bold") + "         " + result)
     for c in p.checks:
         tag = {"error": "error", "warning": "warning", "info": "note"}[c.severity]
-        print(f"  {tag:<14} {c.message}")
+        print("  " + _c(f"{tag:<14}", style.SEVERITY_COLOR[c.severity]) + " " + c.message)
     for s in p.suggestions:
-        print(f"  try            {s}")
-    for n in loaded.spec.notes + w.notes:
-        print(f"  note           {n}")
+        print("  " + _c("try", "cyan") + f"            {s}")
+    notes = loaded.spec.notes + w.notes
     if o.encoder_note and not o.user_override:
-        print(f"  note           {o.encoder_note}")
+        notes.append(o.encoder_note)
     if not o.user_override and not o.calibrated:
-        print("  note           runtime overheads for this model are a rough estimate: they were calibrated on "
-              "dense models only; pass --overhead-gib to override")
+        notes.append("runtime overheads for this model are a rough estimate: they were calibrated on dense models "
+                     "only; pass --overhead-gib to override")
+    for n in notes:
+        print(_c(f"  note           {n}", "dim"))
 
 
 def _exit_code(starts) -> int:
@@ -296,8 +312,9 @@ def cmd_check(args) -> int:
         _print_check(r, args.gpu_memory_utilization)
         if r.starts and not local and not args.download:
             print()
-            print(f"  download       kvplan download {r.model}   (or add --download to this check)")
-            print(f"  serve          {r.serve_command}")
+            print("  " + _c("download", "cyan") + f"       kvplan download {r.model}   "
+                  "(or add --download to this check)")
+            print("  " + _c("serve", "cyan") + f"          {r.serve_command}")
 
     _emit(args, text, r.to_dict(), [r.row()], r.model)
     if args.download and r.starts and not local:
@@ -339,8 +356,16 @@ def _check_many(args) -> int:
         print("\r\033[K", end="", file=sys.stderr)
 
     def text():
+        verdict_starts = {"vLLM should start": True, "vLLM will not start": False}
+
+        def paint(col, cell, row):
+            if col != "verdict":
+                return cell
+            return _c(cell, "red" if row.get("verdict") == "error" else
+                      style.verdict_color(verdict_starts.get(row.get("verdict"))))
+
         print(output.table(rows, ["model", "gpu", "tp", "max_model_len", "verdict", "weights_gib", "kv_tokens",
-                                  "max_concurrency", "problems"]))
+                                  "max_concurrency", "problems"], paint=paint))
 
     _emit(args, text, results, rows, "kvplan-check")
     return {v: k for k, v in _SEVERITY.items()}[worst]
@@ -493,20 +518,20 @@ def cmd_recommend(args) -> int:
 
     def text():
         sizes = "/".join(str(t) for t in res["tp_options"])
-        print(f"\n{task} models for {sizes} x {res['gpu']}, {priority} ({PRIORITIES[priority]}), "
-              f"{res['max_model_len']:,}-token context\n")
+        print("\n" + _c(f"{task} models for {sizes} x {res['gpu']}, {priority} ({PRIORITIES[priority]}), "
+                        f"{res['max_model_len']:,}-token context", "bold") + "\n")
         if not recs:
-            print("  none of the checked models should start with these settings; try a shorter context, more "
-                  "GPUs or --priority speed")
+            print(_c("  none of the checked models should start with these settings; try a shorter context, more "
+                     "GPUs or --priority speed", "yellow"))
         else:
             print(f"  {'#':>2}  {'model':<52} {'size':>6} {'GPUs':>4} {'weights/GPU':>11} {'KV tokens':>11} "
                   f"{'requests at once':>16}")
             for n, r in enumerate(recs, 1):
                 print(f"  {n:>2}  {r['model']:<52} {_fmt_count(r['parameters']):>6} {r['tp']:>4} "
                       f"{r['weights_gib']:>7.2f} GiB {r['kv_tokens']:>11,} {r['max_concurrency']:>15.1f}x"
-                      + ("  (gated)" if r["gated"] else ""))
+                      + _c("  (gated)" if r["gated"] else "", "yellow"))
                 for w in r["warnings"]:
-                    print(f"      {w}")
+                    print(_c(f"      {w}", "yellow"))
         print(f"\n  Checked {res['checked']} of {res['considered']} candidates from Hugging Face's most downloaded "
               f"{res['pipeline_tag']} models. Ranked by size and downloads, not by benchmark scores.")
         if res["left_out"]:
@@ -544,6 +569,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         settings = config.load_config(args.config)
+        style.set_mode(args.color or settings.get("color") or "auto")
         if settings:
             config.apply(subparsers[args.command], args.command, settings)
             args = parser.parse_args(argv)
@@ -554,7 +580,7 @@ def main(argv: list[str] | None = None) -> int:
         print(file=sys.stderr)
         return 130
     except api.KvplanError as e:
-        print(f"kvplan: {e}", file=sys.stderr)
+        print(style.paint(f"kvplan: {e}", "red", on=style.enabled(sys.stderr)), file=sys.stderr)
         return 2
 
 

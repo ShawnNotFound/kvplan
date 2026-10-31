@@ -47,13 +47,17 @@ def _cell(v) -> str:
     return str(v)
 
 
-def table(rows: list[dict], columns: list[str] | None = None) -> str:
-    """A plain aligned text table."""
+def table(rows: list[dict], columns: list[str] | None = None, paint=None) -> str:
+    """A plain aligned text table. paint(column, padded cell, row) may colour a cell after padding."""
     cols = columns or _columns(rows)
     cells = [[_cell(r.get(c)) for c in cols] for r in rows]
     widths = [max([len(c)] + [len(row[i]) for row in cells]) for i, c in enumerate(cols)]
     lines = ["  ".join(c.ljust(w) for c, w in zip(cols, widths)).rstrip()]
-    lines += ["  ".join(v.ljust(w) for v, w in zip(row, widths)).rstrip() for row in cells]
+    for r, row in zip(rows, cells):
+        padded = [v.ljust(w) for v, w in zip(row, widths)]
+        if paint:
+            padded = [paint(c, p, r) for c, p in zip(cols, padded)]
+        lines.append("  ".join(padded).rstrip())
     return "\n".join(lines)
 
 

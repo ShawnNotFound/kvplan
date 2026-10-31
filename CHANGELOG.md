@@ -11,6 +11,7 @@
 - Output formats and files: `--format text|json|jsonl|csv|markdown` and `-o/--output` (a file, or a directory for one file per model), with `--append` for CSV and JSON Lines logs.
 - `kvplan check --models FILE`: check a list of models (text, CSV with per-model option columns, or JSON; `-` for standard input) in one run, with one table or file for all of them.
 - Config files (`~/.config/kvplan/config.toml` or `.json`, `KVPLAN_CONFIG`, `--config`): default options for every command or per command.
+- Coloured terminal output: the verdict is green (should start), red (will not start) or yellow (not confirmed), errors are red and warnings yellow. `--color auto|always|never`; `NO_COLOR` and `FORCE_COLOR` are respected, and files, pipes and data formats stay plain.
 - Python API: `kvplan.check`, `inspect`, `search`, `recommend` and `download` return plain data for use in other programs; the command line is now built on it.
 - `kvplan login`: check a Hugging Face token and save it where huggingface_hub, vLLM and huggingface-cli read it. `HF_TOKEN_PATH` and `XDG_CACHE_HOME` are now respected when looking for a saved token.
 
